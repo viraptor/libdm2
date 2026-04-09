@@ -104,16 +104,12 @@ enum DefaultUnsupported {
     /// per-block overhead, or the image is too narrow/short for the
     /// prediction pipeline to be applied.
     ImageTooSmall,
-    /// Alpha values vary across the tile. The alpha plane in our type-2
-    /// layout overlaps the YCC prediction-mode bytes for the trailing
-    /// rows, so non-uniform alpha cannot be round-tripped here.
-    VaryingAlpha,
 }
 
 /// Decide whether `info`/`pixels` can go through the Apple-compatible
 /// type-2 pipeline. Returns `None` if it can; otherwise the specific
 /// limitation that forces a lossless fallback.
-fn default_limitation(pixels: &[u8], info: &ImageInfo) -> Option<DefaultUnsupported> {
+fn default_limitation(_pixels: &[u8], info: &ImageInfo) -> Option<DefaultUnsupported> {
     if info.format.is_16bit() {
         return Some(DefaultUnsupported::SixteenBit);
     }
@@ -121,15 +117,6 @@ fn default_limitation(pixels: &[u8], info: &ImageInfo) -> Option<DefaultUnsuppor
     let int_size = info.height as usize * (k * info.width as usize + 1);
     if int_size < 4096 || info.width < 2 || info.height < 2 {
         return Some(DefaultUnsupported::ImageTooSmall);
-    }
-    let has_alpha = matches!(info.format.channels(), 2 | 4);
-    if has_alpha {
-        let ps = info.format.pixel_size();
-        let alpha_ch = ps - 1;
-        let first_alpha = pixels[alpha_ch];
-        if pixels.chunks(ps).any(|px| px[alpha_ch] != first_alpha) {
-            return Some(DefaultUnsupported::VaryingAlpha);
-        }
     }
     None
 }

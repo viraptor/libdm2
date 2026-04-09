@@ -159,7 +159,12 @@ fn default_small_falls_back_to_lossless() {
 }
 
 #[test]
-fn default_varying_alpha_falls_back() {
+fn default_varying_alpha_roundtrips() {
+    // Varying alpha is now handled directly by the Type 2 encoder (the alpha
+    // plane occupies its own W×H region ahead of the YCC mode bytes — no
+    // overlap, contrary to an earlier assumption). Verify it stays as
+    // Default and round-trips through our own decoder exactly (alpha is
+    // stored raw; only YCC channels carry rounding noise).
     let mut px = vec![0u8; 64 * 64 * 4];
     for i in 0..64 * 64 {
         px[i * 4] = 100; px[i * 4 + 1] = 150; px[i * 4 + 2] = 200;
@@ -168,11 +173,14 @@ fn default_varying_alpha_falls_back() {
     let info = ImageInfo { width: 64, height: 64, format: PixelFormat::Rgba8 };
     let enc = dm2_encode(&px, &info, Compression::Default).unwrap();
     let (_, comp) = dm2_read_info(&enc).unwrap();
-    assert_eq!(comp, Compression::Lossless, "varying alpha RGBA should fall back");
+    assert_eq!(comp, Compression::Default, "varying alpha RGBA should stay Default");
     let mut dec = vec![0u8; px.len()];
     let mut di = ImageInfo { width: 0, height: 0, format: PixelFormat::Gray8 };
     dm2_decode(&enc, &mut dec, &mut di).unwrap();
-    assert_eq!(&dec, &px);
+    // Alpha bytes are stored raw — must match exactly.
+    for i in 0..64 * 64 {
+        assert_eq!(dec[i * 4 + 3], px[i * 4 + 3], "alpha mismatch at pixel {i}");
+    }
 }
 
 // ---------------------------------------------------------------------------

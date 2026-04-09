@@ -380,6 +380,38 @@ fn cross_default_multitile() {
     check_pair(&api, "default_multitile_rgb8_256x2200", &pixels, &info, Compression::Default);
 }
 
+/// Regression: alpha channels with varying values must be encoded as a real
+/// Type 2 stream (not silently downgraded to Lossless). Earlier the encoder
+/// bailed on the assumption that the alpha plane overlapped the YCC mode
+/// bytes — it doesn't (per deepmap2.md the alpha plane is its own W×H
+/// region preceding the H mode bytes).
+#[test]
+fn cross_default_varying_alpha() {
+    let Some(api) = apple_api() else { return };
+
+    for &fmt in &[PixelFormat::GrayA8, PixelFormat::Rgba8] {
+        let w = 64u32;
+        let h = 64u32;
+        // gradient() varies every channel including alpha.
+        let pixels = gradient(w, h, fmt);
+        let info = ImageInfo { width: w, height: h, format: fmt };
+
+        let encoded = dm2_encode(&pixels, &info, Compression::Default)
+            .expect("varying-alpha Default encode failed");
+        let (_i, comp) = dm2_read_info(&encoded).expect("read_info failed");
+        assert_eq!(
+            comp,
+            Compression::Default,
+            "{:?} with varying alpha was downgraded from Default (got {:?})",
+            fmt,
+            comp
+        );
+
+        let label = format!("default_varying_alpha_{:?}", fmt);
+        check_pair(&api, &label, &pixels, &info, Compression::Default);
+    }
+}
+
 #[test]
 fn cross_palette_rgba8() {
     let Some(api) = apple_api() else { return };
