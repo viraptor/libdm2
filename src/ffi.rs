@@ -11,13 +11,11 @@ pub struct Dm2ImageInfo {
     pub format: u32,
 }
 
-impl From<&Dm2ImageInfo> for ImageInfo {
-    fn from(c: &Dm2ImageInfo) -> Self {
-        ImageInfo {
-            width: c.width,
-            height: c.height,
-            format: PixelFormat::from_u8(c.format as u8).unwrap_or(PixelFormat::Rgba8),
-        }
+impl TryFrom<&Dm2ImageInfo> for ImageInfo {
+    type Error = Dm2Error;
+    fn try_from(c: &Dm2ImageInfo) -> Result<Self, Dm2Error> {
+        let format = PixelFormat::from_u8(c.format as u8)?;
+        Ok(ImageInfo { width: c.width, height: c.height, format })
     }
 }
 
@@ -61,8 +59,10 @@ pub unsafe extern "C" fn dm2_encode(
     if pixels.is_null() || info.is_null() || out.is_null() || out_len.is_null() {
         return Dm2Error::InvalidArg as i32;
     }
-    let info_c = &*info;
-    let info_r = ImageInfo::from(info_c);
+    let info_r = match ImageInfo::try_from(&*info) {
+        Ok(i) => i,
+        Err(e) => return e as i32,
+    };
     let pix = slice::from_raw_parts(pixels, pixels_len);
 
     let result = if compression == 0 {
@@ -137,7 +137,7 @@ pub extern "C" fn dm2_pixel_size(format: u32) -> u32 {
 #[no_mangle]
 pub unsafe extern "C" fn dm2_encode_bound(info: *const Dm2ImageInfo) -> usize {
     if info.is_null() { return 0; }
-    let info_r = ImageInfo::from(&*info);
+    let Ok(info_r) = ImageInfo::try_from(&*info) else { return 0; };
     crate::dm2_encode_bound(&info_r)
 }
 
@@ -166,8 +166,10 @@ pub unsafe extern "C" fn dm2_encode_file(
         Ok(s) => Path::new(s),
         Err(_) => return Dm2Error::InvalidArg as i32,
     };
-    let info_c = &*info;
-    let info_r = ImageInfo::from(info_c);
+    let info_r = match ImageInfo::try_from(&*info) {
+        Ok(i) => i,
+        Err(e) => return e as i32,
+    };
     let pix = slice::from_raw_parts(pixels, pixels_len);
 
     let result = if compression == 0 {
