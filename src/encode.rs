@@ -104,9 +104,6 @@ enum DefaultUnsupported {
     /// per-block overhead, or the image is too narrow/short for the
     /// prediction pipeline to be applied.
     ImageTooSmall,
-    /// The image would have to be split across multiple type-2 tiles.
-    /// We have not implemented Apple's multi-tile framing for type 2 yet.
-    MultiTile,
     /// Alpha values vary across the tile. The alpha plane in our type-2
     /// layout overlaps the YCC prediction-mode bytes for the trailing
     /// rows, so non-uniform alpha cannot be round-tripped here.
@@ -124,15 +121,6 @@ fn default_limitation(pixels: &[u8], info: &ImageInfo) -> Option<DefaultUnsuppor
     let int_size = info.height as usize * (k * info.width as usize + 1);
     if int_size < 4096 || info.width < 2 || info.height < 2 {
         return Some(DefaultUnsupported::ImageTooSmall);
-    }
-    let tile_h = compute_tile_height(
-        Compression::Default,
-        info.width,
-        info.height,
-        info.format.pixel_size(),
-    );
-    if tile_h < info.height {
-        return Some(DefaultUnsupported::MultiTile);
     }
     let has_alpha = matches!(info.format.channels(), 2 | 4);
     if has_alpha {

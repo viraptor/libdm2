@@ -349,6 +349,37 @@ fn run_format(fmt: PixelFormat) {
 #[test] fn cross_rgb16()   { run_format(PixelFormat::Rgb16); }
 #[test] fn cross_rgba16()  { run_format(PixelFormat::Rgba16); }
 
+/// Regression: an image whose raw byte size exceeds the type-2 tile budget
+/// must be encoded as a real multi-tile Type 2 stream, not silently
+/// downgraded to Lossless. Covers both encode directions through Apple.
+#[test]
+fn cross_default_multitile() {
+    let Some(api) = apple_api() else { return };
+
+    // 256×2200 RGB8 = ~1.65 MB raw, exceeds the 1,044,480-byte Type 2 tile
+    // budget (max ~1360 rows per tile at this width) — forces ≥2 tiles.
+    // RGB8 (no alpha) avoids the VaryingAlpha fallback so we exercise the
+    // Default path itself rather than its other escape hatches.
+    let w = 256u32;
+    let h = 2200u32;
+    let fmt = PixelFormat::Rgb8;
+    let pixels = gradient(w, h, fmt);
+    let info = ImageInfo { width: w, height: h, format: fmt };
+
+    let encoded = dm2_encode(&pixels, &info, Compression::Default)
+        .expect("multi-tile Default encode failed");
+    let (_hdr_info, comp) = dm2_read_info(&encoded).expect("read_info failed");
+    assert_eq!(
+        comp,
+        Compression::Default,
+        "multi-tile image was silently downgraded from Default (got {:?})",
+        comp
+    );
+
+    // Full cross-validation in both directions (ours↔Apple).
+    check_pair(&api, "default_multitile_rgb8_256x2200", &pixels, &info, Compression::Default);
+}
+
 #[test]
 fn cross_palette_rgba8() {
     let Some(api) = apple_api() else { return };
