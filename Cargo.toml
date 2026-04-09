@@ -1,0 +1,11 @@
+[package]
+name = "libdm2"
+version = "0.1.0"
+edition = "2021"
+description = "Encoder/decoder for Apple's deepmap2 image buffer compression format"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[build-dependencies]
+pkg-config = "0.3"
