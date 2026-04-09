@@ -8,15 +8,33 @@ pub fn decode(data: &[u8], pixels: &mut [u8], info: &mut ImageInfo) -> Result<()
     let (header, hdr_len) = Header::read(data)?;
     let width = header.tile_width as u32;
     let ps = header.format.pixel_size();
-    let row_bytes = width as usize * ps;
+    let row_bytes = (width as usize)
+        .checked_mul(ps)
+        .ok_or(Dm2Error::BufferTooSmall)?;
+    if row_bytes == 0 {
+        return Err(Dm2Error::BadFormat);
+    }
 
-    // The header stores tile dimensions, not full image dimensions.
-    // Infer full height from the output buffer the caller provided.
-    let image_height = if row_bytes > 0 { (pixels.len() / row_bytes) as u32 } else { 0 };
+    // The header stores tile dimensions, not full image dimensions, so
+    // the caller's output buffer is the only place we can recover the
+    // image height from. Require it to be a clean multiple of one row
+    // and within u32; otherwise the dimensions are inconsistent.
+    if pixels.len() % row_bytes != 0 {
+        return Err(Dm2Error::BufferTooSmall);
+    }
+    let image_height_us = pixels.len() / row_bytes;
+    if image_height_us > u32::MAX as usize {
+        return Err(Dm2Error::BufferTooSmall);
+    }
+    let image_height = image_height_us as u32;
 
     info.width = width;
     info.height = image_height;
     info.format = header.format;
+
+    // Validate that the inferred dimensions don't overflow when multiplied
+    // out — protects every downstream allocation sized from `info`.
+    info.checked_raw_size()?;
 
     match header.compression {
         Compression::None => decode_none(&data[hdr_len..], pixels, info),

@@ -86,8 +86,21 @@ pub struct ImageInfo {
 }
 
 impl ImageInfo {
+    /// Total raw pixel-data size in bytes, or `Err(BufferTooSmall)` if
+    /// `width * height * pixel_size` would overflow `usize`. Use this
+    /// before allocating buffers sized from untrusted header dimensions.
+    pub fn checked_raw_size(&self) -> Result<usize> {
+        (self.width as usize)
+            .checked_mul(self.height as usize)
+            .and_then(|wh| wh.checked_mul(self.format.pixel_size()))
+            .ok_or(Dm2Error::BufferTooSmall)
+    }
+
+    /// Infallible version of [`Self::checked_raw_size`]. Panics on
+    /// `usize` overflow — only safe to call after the dimensions have
+    /// already been validated (e.g. on info you constructed yourself).
     pub fn raw_size(&self) -> usize {
-        self.width as usize * self.height as usize * self.format.pixel_size()
+        self.checked_raw_size().expect("raw_size overflow")
     }
 
     pub fn row_bytes(&self) -> usize {

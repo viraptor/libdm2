@@ -7,7 +7,8 @@ pub fn encode(pixels: &[u8], info: &ImageInfo, compression: Compression) -> Resu
     if info.width == 0 || info.height == 0 {
         return Err(Dm2Error::InvalidArg);
     }
-    if pixels.len() < info.raw_size() {
+    let need = info.checked_raw_size()?;
+    if pixels.len() < need {
         return Err(Dm2Error::BufferTooSmall);
     }
     match compression {
@@ -361,15 +362,20 @@ fn encode_palette(pixels: &[u8], info: &ImageInfo) -> Result<Vec<u8>> {
 
     for i in 0..npix {
         let c = [pixels[i * 4], pixels[i * 4 + 1], pixels[i * 4 + 2], pixels[i * 4 + 3]];
-        let idx = color_map.entry(c).or_insert_with(|| {
-            let idx = colors.len() as u8;
-            colors.push(c);
+        let idx = if let Some(&idx) = color_map.get(&c) {
             idx
-        });
-        if colors.len() > 256 {
-            return Err(Dm2Error::EncodeFailed);
-        }
-        indices[i] = *idx;
+        } else {
+            // Bounds-check *before* inserting so we never grow `colors`
+            // past the 256-entry limit even transiently.
+            if colors.len() == 256 {
+                return Err(Dm2Error::EncodeFailed);
+            }
+            let new_idx = colors.len() as u8;
+            colors.push(c);
+            color_map.insert(c, new_idx);
+            new_idx
+        };
+        indices[i] = idx;
     }
 
     let tile_h = compute_tile_height(Compression::Palette, info.width, info.height, 1);
