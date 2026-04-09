@@ -90,33 +90,78 @@ fn encode_lossless(pixels: &[u8], info: &ImageInfo) -> Result<Vec<u8>> {
     Ok(out)
 }
 
-/// Type 2 encoding with Apple-compatible pipeline.
-/// Falls back to type 3 for: 16-bit formats, images too small for LZFSE,
-/// multi-tile images (tiling edge cases), and GrayA (format converter not
-/// fully reverse-engineered).
-fn encode_default(pixels: &[u8], info: &ImageInfo) -> Result<Vec<u8>> {
+/// Why our type-2 encoder cannot match Apple's output for a given image.
+/// Each variant identifies an Apple-compatible code path we have not yet
+/// reverse-engineered. When any of these applies the encoder transparently
+/// falls back to lossless (type 3).
+#[derive(Debug, Clone, Copy)]
+enum DefaultUnsupported {
+    /// Type 2 has no defined encoding for 16-bit pixel formats — Apple's
+    /// own type-2 round-trip is broken for them (see deepmap2.md).
+    SixteenBit,
+    /// The intermediate buffer is too small for LZFSE to amortize its
+    /// per-block overhead, or the image is too narrow/short for the
+    /// prediction pipeline to be applied.
+    ImageTooSmall,
+    /// The image would have to be split across multiple type-2 tiles.
+    /// We have not implemented Apple's multi-tile framing for type 2 yet.
+    MultiTile,
+    /// Alpha values vary across the tile. The alpha plane in our type-2
+    /// layout overlaps the YCC prediction-mode bytes for the trailing
+    /// rows, so non-uniform alpha cannot be round-tripped here.
+    VaryingAlpha,
+}
+
+/// Decide whether `info`/`pixels` can go through the Apple-compatible
+/// type-2 pipeline. Returns `None` if it can; otherwise the specific
+/// limitation that forces a lossless fallback.
+fn default_limitation(pixels: &[u8], info: &ImageInfo) -> Option<DefaultUnsupported> {
     if info.format.is_16bit() {
-        return Err(Dm2Error::BadFormat);
+        return Some(DefaultUnsupported::SixteenBit);
     }
-    let tile_h = compute_tile_height(Compression::Default, info.width, info.height, info.format.pixel_size());
-    let needs_tiling = tile_h < info.height;
     let k = byte_planes_for(info.format);
     let int_size = info.height as usize * (k * info.width as usize + 1);
-    let too_small = int_size < 4096 || info.width < 2 || info.height < 2;
-    // For alpha-containing formats: the last H bytes of the alpha plane store
-    // YCC prediction modes, so varying alpha in those positions can't be recovered.
-    let has_alpha = info.format.channels() == 2 || info.format.channels() == 4;
-    let has_varying_alpha = has_alpha && {
+    if int_size < 4096 || info.width < 2 || info.height < 2 {
+        return Some(DefaultUnsupported::ImageTooSmall);
+    }
+    let tile_h = compute_tile_height(
+        Compression::Default,
+        info.width,
+        info.height,
+        info.format.pixel_size(),
+    );
+    if tile_h < info.height {
+        return Some(DefaultUnsupported::MultiTile);
+    }
+    let has_alpha = matches!(info.format.channels(), 2 | 4);
+    if has_alpha {
         let ps = info.format.pixel_size();
         let alpha_ch = ps - 1;
         let first_alpha = pixels[alpha_ch];
-        pixels.chunks(ps).any(|px| px[alpha_ch] != first_alpha)
-    };
-    let unsupported = has_varying_alpha || needs_tiling;
-    if too_small || unsupported {
-        return encode_lossless(pixels, info);
+        if pixels.chunks(ps).any(|px| px[alpha_ch] != first_alpha) {
+            return Some(DefaultUnsupported::VaryingAlpha);
+        }
     }
+    None
+}
 
+/// Type 2 (Default) encoding with the Apple-compatible pipeline.
+///
+/// This is a strict subset of Apple's encoder. The cases we **don't**
+/// implement are enumerated by [`DefaultUnsupported`] and trigger a
+/// transparent fallback to lossless (type 3) so callers always get a
+/// valid stream. The decoder, by contrast, supports the full type-2
+/// format including all five prediction modes.
+fn encode_default(pixels: &[u8], info: &ImageInfo) -> Result<Vec<u8>> {
+    match default_limitation(pixels, info) {
+        // 16-bit is a hard rejection: Apple's own type-2 round-trip is
+        // broken for these formats, so we refuse rather than silently
+        // pick a different scheme.
+        Some(DefaultUnsupported::SixteenBit) => return Err(Dm2Error::BadFormat),
+        // Every other limitation is a transparent fallback to lossless.
+        Some(_) => return encode_lossless(pixels, info),
+        None => {}
+    }
     let tile_h = compute_tile_height(Compression::Default, info.width, info.height, info.format.pixel_size());
     let mut out = write_header(info, Compression::Default, tile_h, None)?;
     let row_bytes = info.row_bytes();
@@ -189,6 +234,12 @@ fn encode_default_tile_gray(pixels: &[u8], w: usize, h: usize, format: PixelForm
 /// Layout: [H modes][H*W alpha][H*3*W high_interleaved][H*3*W low_interleaved]
 /// The alpha plane's last row stores YCC prediction modes (all 0 = None).
 /// Mode byte = first pixel alpha per row. YCC values stored as raw adjusted zigzag.
+///
+/// **Limitation:** this encoder always emits prediction mode 0 (None) for
+/// every row. The decoder handles all five modes — Apple's encoder picks
+/// the cheapest per row — but reproducing Apple's mode-selection heuristic
+/// for multi-channel data is not yet implemented. Output is still valid
+/// and round-trippable, just larger than Apple's for structured images.
 fn encode_default_tile_ycc(pixels: &[u8], w: usize, h: usize, format: PixelFormat) -> Result<Vec<u8>> {
     let channels = format.channels();
     let has_alpha = channels == 2 || channels == 4;
