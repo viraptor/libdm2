@@ -133,12 +133,21 @@ fn decode_default_tile(tile_data: &[u8], pixels: &mut [u8], w: usize, h: usize, 
         return decode_default_tile_ycc(tile_data, pixels, w, h, format);
     }
 
-    let min_size = h * (2 * w + 1);
-    let buf_size = (min_size + 15) & !15;
+    // min_size = h * (2*w + 1); compute with checked arithmetic so hostile
+    // tile dimensions can't overflow on 32-bit targets or wrap to a small value.
+    let plane = w.checked_mul(h).ok_or(Dm2Error::BadFormat)?;
+    let two_planes = plane.checked_mul(2).ok_or(Dm2Error::BadFormat)?;
+    let min_size = two_planes.checked_add(h).ok_or(Dm2Error::BadFormat)?;
+    let buf_size = min_size.checked_add(15).ok_or(Dm2Error::BadFormat)? & !15;
 
     let decompressed = lzfse::decompress(tile_data, buf_size)?;
     if decompressed.len() < min_size || decompressed.len() > buf_size {
         return Err(Dm2Error::DecodeFailed);
+    }
+    // Caller passed `pixels[pix_start..pix_end]` sized `rows * row_bytes`,
+    // i.e. exactly h*w bytes for a 1-channel format. Verify defensively.
+    if pixels.len() < plane {
+        return Err(Dm2Error::BufferTooSmall);
     }
 
     let mut cur = vec![0i16; w];
@@ -146,12 +155,15 @@ fn decode_default_tile(tile_data: &[u8], pixels: &mut [u8], w: usize, h: usize, 
     let mut residuals = vec![0i16; w];
 
     for row in 0..h {
-        let mode = PredictMode::from_u8(decompressed[row]).ok_or(Dm2Error::DecodeFailed)?;
+        let mode_byte = *decompressed.get(row).ok_or(Dm2Error::DecodeFailed)?;
+        let mode = PredictMode::from_u8(mode_byte).ok_or(Dm2Error::DecodeFailed)?;
 
         let high_plane = h + row * w;
-        let low_plane = h + w * h + row * w;
+        let low_plane = h + plane + row * w;
+        let high = decompressed.get(high_plane..high_plane + w).ok_or(Dm2Error::DecodeFailed)?;
+        let low = decompressed.get(low_plane..low_plane + w).ok_or(Dm2Error::DecodeFailed)?;
         for i in 0..w {
-            let z = ((decompressed[high_plane + i] as u16) << 8) | (decompressed[low_plane + i] as u16);
+            let z = ((high[i] as u16) << 8) | (low[i] as u16);
             let mut res = predict::zigzag_decode(z);
             if res < 0 { res += 1; }
             residuals[i] = res;
@@ -179,32 +191,44 @@ fn decode_default_tile_ycc(tile_data: &[u8], pixels: &mut [u8], w: usize, h: usi
     let channels = format.channels();
     let has_alpha = channels == 2 || channels == 4;
     let k = byte_planes_for(format);
-    let min_size = h * (k * w + 1);
-    let buf_size = (min_size + 15) & !15;
+    // Checked size arithmetic — guards against overflow on hostile tile dims.
+    let plane = w.checked_mul(h).ok_or(Dm2Error::BadFormat)?;
+    let kw = k.checked_mul(w).ok_or(Dm2Error::BadFormat)?;
+    let kw1 = kw.checked_add(1).ok_or(Dm2Error::BadFormat)?;
+    let min_size = h.checked_mul(kw1).ok_or(Dm2Error::BadFormat)?;
+    let buf_size = min_size.checked_add(15).ok_or(Dm2Error::BadFormat)? & !15;
 
     let buf = lzfse::decompress(tile_data, buf_size)?;
     if buf.len() < min_size || buf.len() > buf_size {
         return Err(Dm2Error::DecodeFailed);
     }
 
-    let n_color = if channels <= 2 { 1 } else { 3 };
-    let alpha_plane_size = if has_alpha { w * h } else { 0 };
+    let n_color: usize = if channels <= 2 { 1 } else { 3 };
+    let alpha_plane_size = if has_alpha { plane } else { 0 };
     let ycc_modes_off = alpha_plane_size;
-    let high_off = alpha_plane_size + h;
-    let low_off = high_off + n_color * w * h;
+    let high_off = alpha_plane_size.checked_add(h).ok_or(Dm2Error::BadFormat)?;
+    let n_color_plane = n_color.checked_mul(plane).ok_or(Dm2Error::BadFormat)?;
+    let low_off = high_off.checked_add(n_color_plane).ok_or(Dm2Error::BadFormat)?;
+    // Final byte we will read is at low_off + n_color_plane - 1; ensure buf covers it.
+    let end = low_off.checked_add(n_color_plane).ok_or(Dm2Error::BadFormat)?;
+    if buf.len() < end {
+        return Err(Dm2Error::DecodeFailed);
+    }
 
     let mut prev_y = vec![0i16; w];
     let mut prev_co = vec![0i16; w];
     let mut prev_cg = vec![0i16; w];
 
     for row in 0..h {
-        let ycc_mode = buf[ycc_modes_off + row];
+        let ycc_mode = *buf.get(ycc_modes_off + row).ok_or(Dm2Error::DecodeFailed)?;
 
         let mut cur_y = vec![0i16; w];
         let mut cur_co = vec![0i16; w];
         let mut cur_cg = vec![0i16; w];
 
-        let mode = PredictMode::from_u8(ycc_mode).unwrap_or(PredictMode::None);
+        // A malformed mode byte should fail the decode rather than be silently
+        // coerced to None — that would mask corruption and produce wrong pixels.
+        let mode = PredictMode::from_u8(ycc_mode).ok_or(Dm2Error::DecodeFailed)?;
         for i in 0..w {
             let hi = high_off + row * n_color * w + i * n_color;
             let lo = low_off + row * n_color * w + i * n_color;
@@ -330,9 +354,13 @@ fn decode_palette(data: &[u8], hdr_len: usize, pixels: &mut [u8], info: &ImageIn
     let has_tile_alpha = header.palette_bpe == 3;
 
     decode_tiled(&data[hdr_len..], pixels, info, header, |tile_data, out, w, h| {
-        let npix = w * h;
-        let raw_size = if has_tile_alpha { npix * 2 } else { npix };
-        let padded = (raw_size + 15) & !15;
+        let npix = w.checked_mul(h).ok_or(Dm2Error::BadFormat)?;
+        let raw_size = if has_tile_alpha {
+            npix.checked_mul(2).ok_or(Dm2Error::BadFormat)?
+        } else {
+            npix
+        };
+        let padded = raw_size.checked_add(15).ok_or(Dm2Error::BadFormat)? & !15;
         let tile = lzfse::decompress(tile_data, padded)?;
         if tile.len() < raw_size || tile.len() > padded {
             return Err(Dm2Error::DecodeFailed);
