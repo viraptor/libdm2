@@ -212,7 +212,7 @@ pub fn encode(src: &[u8]) -> Vec<u8> {
     while i < end {
         // Invariant: `end <= src.len() - 8`, so `i + 4 <= src.len()`.
         debug_assert!(i + 4 <= src.len());
-        let val = u32::from_le_bytes(src[i..i + 4].try_into().expect("4-byte slice"));
+        let val = u32::from_le_bytes([src[i], src[i + 1], src[i + 2], src[i + 3]]);
         let h = hash3i(val);
         let entry = &mut table[h];
 

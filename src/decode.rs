@@ -100,7 +100,7 @@ where
             return Err(Dm2Error::DecodeFailed);
         }
         // Bounds checked immediately above.
-        let tile_sz = u32::from_le_bytes(data[offset..offset + 4].try_into().expect("4-byte slice")) as usize;
+        let tile_sz = u32::from_le_bytes([data[offset], data[offset + 1], data[offset + 2], data[offset + 3]]) as usize;
         offset += 4;
         if offset + tile_sz > data.len() {
             return Err(Dm2Error::DecodeFailed);
