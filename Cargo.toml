@@ -3,6 +3,8 @@ name = "libdm2"
 version = "0.1.0"
 edition = "2021"
 description = "Encoder/decoder for Apple's deepmap2 image buffer compression format"
+license = "BSD-3-Clause"
+authors = ["Stan Pitucha"] # but mostly LLM
 
 [lib]
 crate-type = ["cdylib", "rlib"]
