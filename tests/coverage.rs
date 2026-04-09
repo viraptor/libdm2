@@ -496,7 +496,7 @@ fn unpredict_upleft() {
     // Residuals are all 0 → output should reconstruct prev exactly
     let residuals = vec![0i16; 5];
     let mut out = vec![0i16; 5];
-    unpredict_row(&residuals, Some(&prev), PredictMode::UpLeft, &mut out);
+    unpredict_row(&residuals, Some(&prev), PredictMode::UpLeft, &mut out).unwrap();
     assert_eq!(&out, &prev, "zero residuals with UpLeft should reproduce prev row");
 }
 
@@ -508,7 +508,7 @@ fn unpredict_mean() {
     // With residual=0 and prev=100 everywhere: output should be 100 everywhere.
     let residuals = vec![0i16; 4];
     let mut out = vec![0i16; 4];
-    unpredict_row(&residuals, Some(&prev), PredictMode::Mean, &mut out);
+    unpredict_row(&residuals, Some(&prev), PredictMode::Mean, &mut out).unwrap();
     assert_eq!(&out, &[100, 100, 100, 100]);
 }
 
@@ -519,7 +519,7 @@ fn unpredict_mean_negative_sum() {
     let prev = vec![-100i16, -100];
     let residuals = vec![0i16, 0];
     let mut out = vec![0i16; 2];
-    unpredict_row(&residuals, Some(&prev), PredictMode::Mean, &mut out);
+    unpredict_row(&residuals, Some(&prev), PredictMode::Mean, &mut out).unwrap();
     assert_eq!(out[0], -100); // x=0: pred = up = -100
     assert_eq!(out[1], -99);  // x=1: pred = (-100 + -100 + 1 + 1) >> 1 = -198 >> 1 = -99
 }
@@ -537,7 +537,7 @@ fn unpredict_upleft_paeth_selection() {
     let prev = vec![0i16, 100, 0];
     let residuals = vec![0i16, 0, 0];
     let mut out = vec![0i16; 3];
-    unpredict_row(&residuals, Some(&prev), PredictMode::UpLeft, &mut out);
+    unpredict_row(&residuals, Some(&prev), PredictMode::UpLeft, &mut out).unwrap();
     assert_eq!(&out, &[0, 100, 0]);
 }
 
