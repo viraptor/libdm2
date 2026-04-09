@@ -159,7 +159,7 @@ pub unsafe extern "C" fn dm2_encode_file(
     compression: u32,
     path: *const std::ffi::c_char,
 ) -> i32 {
-    if path.is_null() {
+    if path.is_null() || pixels.is_null() || info.is_null() {
         return Dm2Error::InvalidArg as i32;
     }
     let path = match CStr::from_ptr(path).to_str() {
