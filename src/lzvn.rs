@@ -6,6 +6,10 @@
 /// The format uses variable-length opcodes to encode literal runs and
 /// back-references (matches). Each opcode's type is determined by bit
 /// patterns in the first byte, dispatched through a 256-entry table.
+///
+/// We use an external lzfse, but reimplement lzvn - this is stupid.
+/// Future goal - either split this out as its own library or convince
+/// another lzfse crate to expose the lzvn interface publicly.
 
 // ------------------------------------------------------------------
 //  Decoder
