@@ -91,15 +91,17 @@ get_z3() {
 }
 
 if [ -z "$VERUS_BIN" ] && [ "$FROM_SOURCE" = 1 ]; then
-    # Build from source. Last-known-good: see VERUS_GIT_REV default below,
-    # the revision this repo's proofs were developed against.
-    rev="${VERUS_GIT_REV:-}"
+    # Build from source. The default rev is the last known good: the
+    # commit this repo's proofs were verified against
+    # (Verus 0.2026.07.25, "20 verified, 0 errors").
+    rev="${VERUS_GIT_REV:-d64f7c416688cad31753a87af92ad69f7f4dcdc1}"
     mkdir -p .verus
     if [ ! -d .verus/src/.git ]; then
         git clone https://github.com/verus-lang/verus .verus/src
     fi
     if [ -n "$rev" ]; then
-        (cd .verus/src && git fetch -q origin "$rev" && git checkout -q "$rev")
+        (cd .verus/src && git checkout -q "$rev" 2>/dev/null \
+            || { git fetch -q origin "$rev" && git checkout -q "$rev"; })
     fi
     Z3_PATH="$(get_z3)"
     cp "$Z3_PATH" .verus/src/source/z3 2>/dev/null || true

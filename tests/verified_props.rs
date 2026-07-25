@@ -88,8 +88,14 @@ fn residual_adjustment_roundtrip_exhaustive() {
 }
 
 // ---------------------------------------------------------------------
-// wrap_add_i16: verified mask formulation vs std wrapping_add.
+// wrap_add_i16: verified against vstd's trusted wrapping_add spec; here
+// we pin it to the independent mask/modular formulation so a regression
+// in either direction is caught executably.
 // ---------------------------------------------------------------------
+
+fn wrap_add_reference(a: i16, b: i16) -> i16 {
+    (((a as u16 as u32) + (b as u16 as u32)) & 0xffff) as u16 as i16
+}
 
 #[test]
 fn wrap_add_matches_wrapping_add() {
@@ -111,14 +117,14 @@ fn wrap_add_matches_wrapping_add() {
     ];
     for &a in &edges {
         for &b in &edges {
-            assert_eq!(verified::wrap_add_i16(a, b), a.wrapping_add(b), "{a}+{b}");
+            assert_eq!(verified::wrap_add_i16(a, b), wrap_add_reference(a, b), "{a}+{b}");
         }
     }
     let mut rng = Rng::new(0x5eed);
     for _ in 0..1_000_000 {
         let a = rng.next() as i16;
         let b = (rng.next() >> 16) as i16;
-        assert_eq!(verified::wrap_add_i16(a, b), a.wrapping_add(b), "{a}+{b}");
+        assert_eq!(verified::wrap_add_i16(a, b), wrap_add_reference(a, b), "{a}+{b}");
     }
 }
 

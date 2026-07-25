@@ -100,7 +100,13 @@ pub fn zigzag_decode(z: u16) -> (x: i16)
     ensures
         x as u16 == spec_zigzag_decode(z),
 {
-    ((z >> 1) ^ (if z & 1 == 1 { 0xffffu16 } else { 0u16 })) as i16
+    let u: u16 = (z >> 1) ^ (if z & 1 == 1 { 0xffffu16 } else { 0u16 });
+    proof {
+        // Truncating-cast semantics are only exported to the bit-vector
+        // solver; hand the default solver the u16→i16→u16 roundtrip fact.
+        assert(((u as i16) as u16) == u) by (bit_vector);
+    }
+    u as i16
 }
 
 /// The signed-level statement: decoding an encoded residual gives it back.
@@ -109,6 +115,7 @@ pub proof fn lemma_zigzag_roundtrip_signed(x: i16)
         spec_zigzag_decode(spec_zigzag_encode(x as u16)) as i16 == x,
 {
     lemma_zigzag_roundtrip(x as u16);
+    assert(((x as u16) as i16) == x) by (bit_vector);
 }
 
 // ---------------------------------------------------------------------
@@ -195,28 +202,25 @@ pub proof fn lemma_residual_pipeline_roundtrip(res: i16)
 // ---------------------------------------------------------------------
 // 16-bit wrap-around addition
 //
-// `predict::unpredict_row` uses `i16::wrapping_add`; the version here is
-// written with plain arithmetic and a mask so the verifier sees its full
-// semantics without relying on standard-library specs. Equivalence with
-// `wrapping_add` is checked in `tests/verified_props.rs`.
+// vstd ships trusted specifications for the primitive wrapping ops
+// (`vstd::wrapping::i16_specs::wrapping_add` is an int-level, in-range
+// formulation the default solver reasons about directly), so the verified
+// wrapper simply names that semantics in its postcondition.
 // ---------------------------------------------------------------------
 
-/// Spec: addition modulo 2^16 on the unsigned view.
-pub open spec fn spec_wrap_add(a: u16, b: u16) -> u16 {
-    ((a + b) % 0x10000) as u16
+/// Spec: two's-complement wrap-around addition on i16, re-exported from
+/// vstd's trusted spec so callers here have a stable local name.
+pub open spec fn spec_wrap_add(a: i16, b: i16) -> i16 {
+    vstd::wrapping::i16_specs::wrapping_add(a, b)
 }
 
-/// Wrap-around i16 addition (two's complement), equivalent to
-/// `a.wrapping_add(b)`.
+/// Wrap-around i16 addition. The decoder uses this for prediction sums so
+/// hostile residuals cannot overflow-panic debug builds.
 pub fn wrap_add_i16(a: i16, b: i16) -> (r: i16)
     ensures
-        r as u16 == spec_wrap_add(a as u16, b as u16),
+        r == spec_wrap_add(a, b),
 {
-    let au: u32 = (a as u16) as u32;
-    let bu: u32 = (b as u16) as u32;
-    let s: u32 = au + bu;
-    assert(s & 0xffff == s % 0x10000) by (bit_vector);
-    ((s & 0xffff) as u16) as i16
+    a.wrapping_add(b)
 }
 
 // ---------------------------------------------------------------------
@@ -256,12 +260,12 @@ pub fn unpredict_left(res: &[i16]) -> (out: Vec<i16>)
     ensures
         out.len() == res.len(),
         forall|i: int|
-            0 <= i < res@.len() ==> (#[trigger] out@[i]) as u16 == spec_wrap_add(
-                res@[i] as u16,
+            0 <= i < res@.len() ==> (#[trigger] out@[i]) == spec_wrap_add(
+                res@[i],
                 if i == 0 {
-                    0u16
+                    0i16
                 } else {
-                    out@[i - 1] as u16
+                    out@[i - 1]
                 },
             ),
 {
@@ -272,12 +276,12 @@ pub fn unpredict_left(res: &[i16]) -> (out: Vec<i16>)
             k <= res.len(),
             out.len() == k,
             forall|i: int|
-                0 <= i < k ==> (#[trigger] out@[i]) as u16 == spec_wrap_add(
-                    res@[i] as u16,
+                0 <= i < k ==> (#[trigger] out@[i]) == spec_wrap_add(
+                    res@[i],
                     if i == 0 {
-                        0u16
+                        0i16
                     } else {
-                        out@[i - 1] as u16
+                        out@[i - 1]
                     },
                 ),
         decreases res.len() - k,
@@ -302,10 +306,7 @@ pub fn unpredict_up(res: &[i16], prev: &[i16]) -> (out: Vec<i16>)
     ensures
         out.len() == res.len(),
         forall|i: int|
-            0 <= i < res@.len() ==> (#[trigger] out@[i]) as u16 == spec_wrap_add(
-                res@[i] as u16,
-                prev@[i] as u16,
-            ),
+            0 <= i < res@.len() ==> (#[trigger] out@[i]) == spec_wrap_add(res@[i], prev@[i]),
 {
     let mut out: Vec<i16> = Vec::with_capacity(res.len());
     let mut k: usize = 0;
@@ -315,10 +316,7 @@ pub fn unpredict_up(res: &[i16], prev: &[i16]) -> (out: Vec<i16>)
             res@.len() == prev@.len(),
             out.len() == k,
             forall|i: int|
-                0 <= i < k ==> (#[trigger] out@[i]) as u16 == spec_wrap_add(
-                    res@[i] as u16,
-                    prev@[i] as u16,
-                ),
+                0 <= i < k ==> (#[trigger] out@[i]) == spec_wrap_add(res@[i], prev@[i]),
         decreases res.len() - k,
     {
         let v = wrap_add_i16(res[k], prev[k]);

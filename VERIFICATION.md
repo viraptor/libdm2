@@ -80,14 +80,16 @@ Constraints discovered while doing this:
 ## What is verified today
 
 `src/verified.rs` is production code (the encode/decode paths call it)
-and carries Verus specs, checked by `./verify.sh`:
+and carries Verus specs, checked by `./verify.sh`. Current status:
+**20 verified, 0 errors** with Verus `0.2026.07.25.d64f7c4` (the commit
+pinned as `VERUS_GIT_REV` in `verify.sh`):
 
 | Item | Property | Proof style |
 |---|---|---|
 | `zigzag_encode`/`zigzag_decode` | mutually inverse on all 2^16 values (bijection) | 16-bit `bit_vector` |
 | `adjust_residual`/`unadjust_residual` | mutually inverse for every `res > i16::MIN`; unadjust total | linear arithmetic |
 | `lemma_residual_pipeline_roundtrip` | the full type-2 residual pipeline (adjust → zigzag → unzigzag → unadjust) is the identity | composition |
-| `wrap_add_i16` | equals addition mod 2^16 on the unsigned view | `bit_vector` + linear |
+| `wrap_add_i16` | two's-complement wrap-around addition, per vstd's trusted `i16_specs::wrapping_add` | vstd spec |
 | `unpredict_none`/`unpredict_left`/`unpredict_up` | elementwise functional postconditions for the three encoder-emitted prediction modes | loop invariants |
 
 Every proved property also has an executable counterpart in
