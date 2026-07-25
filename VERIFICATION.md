@@ -114,6 +114,15 @@ intermediates), both fixed on this branch using the verified
   against `verify/verified_shim.rs`, which mounts only `src/verified.rs`.
   The rest of the crate (FFI, floats, HashMap) is invisible to the
   verifier — deliberately.
+- `./verify.sh --from-source` clones and builds the verifier instead
+  (rustup toolchain pinned by Verus's `rust-toolchain.toml`, plus a Z3
+  4.12.5 binary from PATH, `get-z3.sh`, or the PyPI `z3-solver` wheel).
+  Use it where GitHub *release* downloads are unavailable but git clones
+  work, or to pin an exact verifier commit via `VERUS_GIT_REV`.
+- The verifier **cannot** be a Cargo dependency: the `verus` and
+  `cargo-verus` names on crates.io are empty placeholders (their stub
+  binary exits 0 on any invocation — `verify.sh` detects and rejects it).
+  Only the libraries (`vstd`, `verus_builtin*`) are published for real.
 - The `vstd` pin in `Cargo.toml` should match the Verus release date used
   by `verify.sh` (both currently 2026-07-12-ish); see comments in both.
 
