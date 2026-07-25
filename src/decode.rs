@@ -3,6 +3,7 @@ use crate::error::{Dm2Error, Result};
 use crate::format::*;
 use crate::lzfse;
 use crate::predict::{self, PredictMode};
+use crate::verified;
 
 pub fn decode(data: &[u8], pixels: &mut [u8], info: &mut ImageInfo) -> Result<()> {
     let (header, hdr_len) = Header::read(data)?;
@@ -164,9 +165,7 @@ fn decode_default_tile(tile_data: &[u8], pixels: &mut [u8], w: usize, h: usize, 
         let low = decompressed.get(low_plane..low_plane + w).ok_or(Dm2Error::DecodeFailed)?;
         for i in 0..w {
             let z = ((high[i] as u16) << 8) | (low[i] as u16);
-            let mut res = predict::zigzag_decode(z);
-            if res < 0 { res += 1; }
-            residuals[i] = res;
+            residuals[i] = verified::unadjust_residual(predict::zigzag_decode(z));
         }
 
         let prev_ref = if row > 0 { Some(prev.as_slice()) } else { None };
@@ -240,23 +239,29 @@ fn decode_default_tile_ycc(tile_data: &[u8], pixels: &mut [u8], w: usize, h: usi
                 (predict::zigzag_decode(zz_co), predict::zigzag_decode(zz_cg))
             } else { (0, 0) };
 
-            if res_y < 0 { res_y += 1; }
-            if res_co < 0 { res_co += 1; }
-            if res_cg < 0 { res_cg += 1; }
+            res_y = verified::unadjust_residual(res_y);
+            res_co = verified::unadjust_residual(res_co);
+            res_cg = verified::unadjust_residual(res_cg);
 
+            // All additions below use the verified wrap-around add: on a
+            // valid stream the values never overflow (so this is
+            // equivalent to `+`), but residuals here come from attacker-
+            // controlled bytes and plain `+` panics debug builds on
+            // hostile input (found by tests/verified_props.rs).
+            let wadd = verified::wrap_add_i16;
             match mode {
                 PredictMode::None => {
                     cur_y[i] = res_y; cur_co[i] = res_co; cur_cg[i] = res_cg;
                 }
                 PredictMode::Left => {
-                    cur_y[i] = res_y + if i == 0 { 0 } else { cur_y[i - 1] };
-                    cur_co[i] = res_co + if i == 0 { 0 } else { cur_co[i - 1] };
-                    cur_cg[i] = res_cg + if i == 0 { 0 } else { cur_cg[i - 1] };
+                    cur_y[i] = wadd(res_y, if i == 0 { 0 } else { cur_y[i - 1] });
+                    cur_co[i] = wadd(res_co, if i == 0 { 0 } else { cur_co[i - 1] });
+                    cur_cg[i] = wadd(res_cg, if i == 0 { 0 } else { cur_cg[i - 1] });
                 }
                 PredictMode::Up => {
-                    cur_y[i] = res_y + prev_y[i];
-                    cur_co[i] = res_co + prev_co[i];
-                    cur_cg[i] = res_cg + prev_cg[i];
+                    cur_y[i] = wadd(res_y, prev_y[i]);
+                    cur_co[i] = wadd(res_co, prev_co[i]);
+                    cur_cg[i] = wadd(res_cg, prev_cg[i]);
                 }
                 PredictMode::UpLeft => {
                     // 2-way Paeth: the selection is computed once on the Y
@@ -273,22 +278,22 @@ fn decode_default_tile_ycc(tile_data: &[u8], pixels: &mut [u8], w: usize, h: usi
                             (cur_y[i-1], cur_co[i-1], cur_cg[i-1])
                         }
                     };
-                    cur_y[i] = res_y + py;
-                    cur_co[i] = res_co + pco;
-                    cur_cg[i] = res_cg + pcg;
+                    cur_y[i] = wadd(res_y, py);
+                    cur_co[i] = wadd(res_co, pco);
+                    cur_cg[i] = wadd(res_cg, pcg);
                 }
                 PredictMode::Mean => {
                     if i == 0 {
-                        cur_y[i] = res_y + prev_y[i];
-                        cur_co[i] = res_co + prev_co[i];
-                        cur_cg[i] = res_cg + prev_cg[i];
+                        cur_y[i] = wadd(res_y, prev_y[i]);
+                        cur_co[i] = wadd(res_co, prev_co[i]);
+                        cur_cg[i] = wadd(res_cg, prev_cg[i]);
                     } else {
                         let mut sy = cur_y[i-1] as i32 + prev_y[i] as i32 + 1; if sy < 0 { sy += 1; }
                         let mut sco = cur_co[i-1] as i32 + prev_co[i] as i32 + 1; if sco < 0 { sco += 1; }
                         let mut scg = cur_cg[i-1] as i32 + prev_cg[i] as i32 + 1; if scg < 0 { scg += 1; }
-                        cur_y[i] = res_y + (sy >> 1) as i16;
-                        cur_co[i] = res_co + (sco >> 1) as i16;
-                        cur_cg[i] = res_cg + (scg >> 1) as i16;
+                        cur_y[i] = wadd(res_y, (sy >> 1) as i16);
+                        cur_co[i] = wadd(res_co, (sco >> 1) as i16);
+                        cur_cg[i] = wadd(res_cg, (scg >> 1) as i16);
                     }
                 }
             }
@@ -300,11 +305,17 @@ fn decode_default_tile_ycc(tile_data: &[u8], pixels: &mut [u8], w: usize, h: usi
         let row_pixels = &mut pixels[row * w * ps..(row + 1) * w * ps];
 
         match format {
+            // The inverse YCoCg math is done in i32: C integer promotion
+            // means Apple's decoder computes these in `int` too, and with
+            // hostile residuals the intermediate values can exceed i16
+            // (plain i16 `+`/`-` here panics debug builds — found by
+            // tests/verified_props.rs). i32 cannot overflow: |inputs| ≤
+            // 32768 and the expression depth is small.
             PixelFormat::Rgba8 => {
                 for i in 0..w {
-                    let co = cur_co[i];
-                    let cg = cur_cg[i];
-                    let t = cur_y[i] - cg / 2;
+                    let co = cur_co[i] as i32;
+                    let cg = cur_cg[i] as i32;
+                    let t = cur_y[i] as i32 - cg / 2;
                     let g = cg + t;
                     let b = t - co / 2;
                     let r = co + b;
@@ -316,9 +327,9 @@ fn decode_default_tile_ycc(tile_data: &[u8], pixels: &mut [u8], w: usize, h: usi
             }
             PixelFormat::Rgb8 => {
                 for i in 0..w {
-                    let co = cur_co[i];
-                    let cg = cur_cg[i];
-                    let t = cur_y[i] - cg / 2;
+                    let co = cur_co[i] as i32;
+                    let cg = cur_cg[i] as i32;
+                    let t = cur_y[i] as i32 - cg / 2;
                     let g = cg + t;
                     let b = t - co / 2;
                     let r = co + b;

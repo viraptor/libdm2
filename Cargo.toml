@@ -9,5 +9,12 @@ authors = ["Stan Pitucha"] # but mostly LLM
 [lib]
 crate-type = ["cdylib", "rlib"]
 
+[dependencies]
+# Verus specification library. Compiles as plain Rust under cargo (all
+# ghost code is erased); the Verus verifier checks src/verified.rs against
+# it in CI. Pinned exactly so the cargo build matches the vstd bundled
+# with the Verus release used for verification (see verify.sh).
+vstd = "=0.0.0-2026-07-12-0122"
+
 [build-dependencies]
 pkg-config = "0.3"

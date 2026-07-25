@@ -2,6 +2,7 @@ use crate::error::{Dm2Error, Result};
 use crate::format::*;
 use crate::lzfse;
 use crate::predict::{self, PredictMode};
+use crate::verified;
 
 pub fn encode(pixels: &[u8], info: &ImageInfo, compression: Compression) -> Result<Vec<u8>> {
     if info.width == 0 || info.height == 0 {
@@ -192,8 +193,8 @@ fn encode_default_tile_gray(pixels: &[u8], w: usize, h: usize, format: PixelForm
                 _ => prev[i],
             };
             let mut res = cur[i] - pred;
-            if mode != PredictMode::None && res < 0 {
-                res -= 1;
+            if mode != PredictMode::None {
+                res = verified::adjust_residual(res);
             }
             let z = predict::zigzag_encode(res);
             buf[h + row * w + i] = (z >> 8) as u8;
@@ -283,15 +284,15 @@ fn encode_default_tile_ycc(pixels: &[u8], w: usize, h: usize, format: PixelForma
 
         // Mode 0 (None): apply per-residual decrement and store
         for i in 0..w {
-            let mut vy = cur_y[i]; if vy < 0 { vy -= 1; }
+            let vy = verified::adjust_residual(cur_y[i]);
             let zz_y = predict::zigzag_encode(vy);
             let hi = high_off + row * n_color * w + i * n_color;
             let lo = low_off + row * n_color * w + i * n_color;
             buf[hi] = (zz_y >> 8) as u8;
             buf[lo] = zz_y as u8;
             if n_color >= 3 {
-                let mut vco = cur_co[i]; if vco < 0 { vco -= 1; }
-                let mut vcg = cur_cg[i]; if vcg < 0 { vcg -= 1; }
+                let vco = verified::adjust_residual(cur_co[i]);
+                let vcg = verified::adjust_residual(cur_cg[i]);
                 let zz_co = predict::zigzag_encode(vco);
                 let zz_cg = predict::zigzag_encode(vcg);
                 buf[hi + 1] = (zz_co >> 8) as u8;

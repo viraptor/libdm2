@@ -141,12 +141,17 @@ pub fn unpredict_row(
     Ok(())
 }
 
+/// Zigzag coding, delegated to the Verus-verified implementation in
+/// [`crate::verified`] (proved to be a bijection with `zigzag_decode` as
+/// its inverse). `tests/verified_props.rs` checks equivalence with the
+/// historical formula `((x as i32 * 2) ^ ((x as i32) >> 15)) as u16`
+/// exhaustively.
 pub fn zigzag_encode(x: i16) -> u16 {
-    ((x as i32 * 2) ^ ((x as i32) >> 15)) as u16
+    crate::verified::zigzag_encode(x)
 }
 
 pub fn zigzag_decode(x: u16) -> i16 {
-    ((x >> 1) as i16) ^ (-((x & 1) as i16))
+    crate::verified::zigzag_decode(x)
 }
 
 #[cfg(test)]
