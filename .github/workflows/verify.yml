@@ -1,0 +1,29 @@
+name: test & verify
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    name: cargo test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install liblzfse
+        run: sudo apt-get update && sudo apt-get install -y liblzfse-dev
+      - name: Run tests
+        run: cargo test
+
+  verus:
+    name: verus verification
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Cache Verus release
+        uses: actions/cache@v4
+        with:
+          path: .verus
+          key: verus-${{ runner.os }}-latest
+      - name: Verify src/verified.rs
+        run: ./verify.sh

@@ -23,6 +23,22 @@ dm2_decode(&encoded, &mut out, &mut info_out)?;
 
 A C ABI is also exported (`dm2_encode`, `dm2_decode`, `dm2_encode_file`, `dm2_decode_file`, `dm2_free`, …). Build with `cargo build --release` to produce both `librlibdm2.a` and the cdylib.
 
+## Formal verification (Verus)
+
+The arithmetic core of the type-2 residual pipeline (zigzag coding, the
+negative-residual adjustment, wrap-around prediction sums, and row
+reconstruction for the encoder-emitted modes) lives in
+[`src/verified.rs`](src/verified.rs) and carries
+[Verus](https://github.com/verus-lang/verus) specifications: the round-trip
+properties are machine-checked proofs, not just tests. `cargo build` does
+not need Verus (ghost code erases; `vstd` is an ordinary dependency) — run
+`./verify.sh` to check the proofs. See [VERIFICATION.md](VERIFICATION.md)
+for what is provable in a codec, what is verified today, and the roadmap.
+
+The proofs are mirrored by exhaustive/property tests in
+`tests/verified_props.rs` (including hostile-input fuzzing of the decoder
+and LZVN layers) that run with plain `cargo test`.
+
 ## Build requirements
 
 - Rust (edition 2021)
