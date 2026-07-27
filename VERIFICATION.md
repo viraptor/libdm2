@@ -87,7 +87,7 @@ pinned as `VERUS_GIT_REV` in `verify.sh`):
 | Item | Property | Proof style |
 |---|---|---|
 | `zigzag_encode`/`zigzag_decode` | mutually inverse on all 2^16 values (bijection) | 16-bit `bit_vector` |
-| `adjust_residual`/`unadjust_residual` | mutually inverse for every `res > i16::MIN`; unadjust total | linear arithmetic |
+| `adjust_residual`/`unadjust_residual` | mutually inverse for every `res > i16::MIN`; unadjust total | linear arithmetic; single-definition style (`#[verifier::allow_in_spec]` + `returns`), so the exec functions are their own spec |
 | `lemma_residual_pipeline_roundtrip` | the full type-2 residual pipeline (adjust → zigzag → unzigzag → unadjust) is the identity | composition |
 | `wrap_add_i16` | two's-complement wrap-around addition, per vstd's trusted `i16_specs::wrapping_add` | vstd spec |
 | `unpredict_none`/`unpredict_left`/`unpredict_up` | elementwise functional postconditions for the three encoder-emitted prediction modes | loop invariants |

@@ -127,37 +127,24 @@ pub proof fn lemma_zigzag_roundtrip_signed(x: i16)
 // produce; `adjust_residual` needs `res > i16::MIN` because
 // `i16::MIN - 1` is not representable (residuals of u8 pixel math are in
 // [-511, 510], far inside that bound).
+//
+// These use `#[verifier::allow_in_spec]` + `returns` instead of separate
+// twin spec functions: one definition serves as both the executable code
+// and its spec-mode meaning, so the lemmas below can name the functions
+// directly.
 // ---------------------------------------------------------------------
 
-pub open spec fn spec_adjust_residual(res: int) -> int {
-    if res < 0 {
-        res - 1
-    } else {
-        res
-    }
-}
-
-pub open spec fn spec_unadjust_residual(v: int) -> int {
-    if v < 0 {
-        v + 1
-    } else {
-        v
-    }
-}
-
-/// The adjustment pair is mutually inverse over the integers.
-pub proof fn lemma_adjust_roundtrip(res: int)
-    ensures
-        spec_unadjust_residual(spec_adjust_residual(res)) == res,
-{
-}
-
 /// Encoder side: decrement negative residuals (pre-zigzag).
+#[verifier::allow_in_spec]
 pub fn adjust_residual(res: i16) -> (r: i16)
     requires
         res > i16::MIN,
-    ensures
-        r as int == spec_adjust_residual(res as int),
+    returns
+        (if res < 0 {
+            (res - 1) as i16
+        } else {
+            res
+        }),
 {
     if res < 0 {
         res - 1
@@ -169,15 +156,29 @@ pub fn adjust_residual(res: i16) -> (r: i16)
 /// Decoder side: increment negative residuals (post-zigzag).
 /// Total: safe on any input, including hostile streams — `v + 1` only
 /// happens when `v < 0`, so it cannot overflow.
+#[verifier::allow_in_spec]
 pub fn unadjust_residual(v: i16) -> (r: i16)
-    ensures
-        r as int == spec_unadjust_residual(v as int),
+    returns
+        (if v < 0 {
+            (v + 1) as i16
+        } else {
+            v
+        }),
 {
     if v < 0 {
         v + 1
     } else {
         v
     }
+}
+
+/// The adjustment pair is mutually inverse for every encodable residual.
+pub proof fn lemma_adjust_roundtrip(res: i16)
+    requires
+        res > i16::MIN,
+    ensures
+        unadjust_residual(adjust_residual(res)) == res,
+{
 }
 
 /// End-to-end residual coding: unadjust ∘ unzigzag ∘ zigzag ∘ adjust = id
@@ -188,15 +189,11 @@ pub proof fn lemma_residual_pipeline_roundtrip(res: i16)
     requires
         res > i16::MIN,
     ensures
-        spec_unadjust_residual(
-            spec_zigzag_decode(
-                spec_zigzag_encode((spec_adjust_residual(res as int)) as i16 as u16),
-            ) as i16 as int,
-        ) == res as int,
+        unadjust_residual(
+            spec_zigzag_decode(spec_zigzag_encode(adjust_residual(res) as u16)) as i16,
+        ) == res,
 {
-    let adj = spec_adjust_residual(res as int) as i16;
-    lemma_zigzag_roundtrip_signed(adj);
-    lemma_adjust_roundtrip(res as int);
+    lemma_zigzag_roundtrip_signed(adjust_residual(res));
 }
 
 // ---------------------------------------------------------------------
