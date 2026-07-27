@@ -8,6 +8,7 @@ pub mod lzfse;
 pub mod lzvn;
 pub mod predict;
 pub mod verified;
+pub mod verified_lzvn;
 
 pub use error::{Dm2Error, Result};
 pub use format::{Compression, ImageInfo, PixelFormat};

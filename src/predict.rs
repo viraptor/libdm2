@@ -89,6 +89,10 @@ pub fn predict_row(
 /// Returns `Err(Dm2Error::DecodeFailed)` if the mode requires a previous
 /// row but `prev_row` is `None` — this can happen when a corrupt header
 /// stores a non-trivial mode for the first row of a tile.
+///
+/// All five mode inversions are implemented in [`crate::verified`] with
+/// Verus-checked functional postconditions; this function only handles
+/// the mode dispatch and the missing-previous-row error.
 pub fn unpredict_row(
     residuals: &[i16],
     prev_row: Option<&[i16]>,
@@ -96,47 +100,16 @@ pub fn unpredict_row(
     out: &mut [i16],
 ) -> crate::error::Result<()> {
     use crate::error::Dm2Error;
+    use crate::verified;
     let w = residuals.len();
+    let out = &mut out[..w];
     let needs_prev = || prev_row.ok_or(Dm2Error::DecodeFailed);
     match mode {
-        PredictMode::None => {
-            out[..w].copy_from_slice(residuals);
-        }
-        PredictMode::Left => {
-            out[0] = residuals[0];
-            for i in 1..w {
-                out[i] = residuals[i].wrapping_add(out[i - 1]);
-            }
-        }
-        PredictMode::Up => {
-            let prev = needs_prev()?;
-            for i in 0..w {
-                out[i] = residuals[i].wrapping_add(prev[i]);
-            }
-        }
-        PredictMode::UpLeft => {
-            // 2-way Paeth: select between up and left (prefer left on tie)
-            let prev = needs_prev()?;
-            out[0] = residuals[0].wrapping_add(prev[0]);
-            for i in 1..w {
-                let p = prev[i] as i32 + out[i - 1] as i32 - prev[i - 1] as i32;
-                let pa = (p - out[i - 1] as i32).unsigned_abs();
-                let pb = (p - prev[i] as i32).unsigned_abs();
-                let pred = if pb < pa { prev[i] } else { out[i - 1] };
-                out[i] = residuals[i].wrapping_add(pred);
-            }
-        }
-        PredictMode::Mean => {
-            // (left + up + 1) / 2 with truncation-toward-zero for negative sums
-            let prev = needs_prev()?;
-            out[0] = residuals[0].wrapping_add(prev[0]); // x=0: pred = up
-            for i in 1..w {
-                let mut sum = out[i - 1] as i32 + prev[i] as i32 + 1;
-                if sum < 0 { sum += 1; } // truncation toward zero correction
-                let pred = (sum >> 1) as i16;
-                out[i] = residuals[i].wrapping_add(pred);
-            }
-        }
+        PredictMode::None => verified::unpredict_none(residuals, out),
+        PredictMode::Left => verified::unpredict_left(residuals, out),
+        PredictMode::Up => verified::unpredict_up(residuals, &needs_prev()?[..w], out),
+        PredictMode::UpLeft => verified::unpredict_upleft(residuals, &needs_prev()?[..w], out),
+        PredictMode::Mean => verified::unpredict_mean(residuals, &needs_prev()?[..w], out),
     }
     Ok(())
 }

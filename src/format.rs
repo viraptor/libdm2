@@ -212,6 +212,8 @@ impl Header {
 
 /// Compute tile height for a given compression type and image dimensions.
 /// Tiles are full-width horizontal strips capped by a raw data budget.
+/// The budget math is Verus-verified in [`crate::verified::tile_rows_for_budget`]
+/// (result in 1..=height and within budget unless one row alone exceeds it).
 pub fn compute_tile_height(compression: Compression, width: u32, height: u32, pixel_size: usize) -> u32 {
     let budget: usize = match compression {
         Compression::None => return height, // no tiling
@@ -222,10 +224,10 @@ pub fn compute_tile_height(compression: Compression, width: u32, height: u32, pi
     if row_bytes == 0 {
         return height;
     }
-    let max_rows = budget / row_bytes;
-    if max_rows == 0 {
-        1
-    } else {
-        height.min(max_rows as u32)
+    if height == 0 {
+        // Degenerate case preserved from the original implementation:
+        // 1 if a single row alone exceeds the budget, else 0.
+        return if budget / row_bytes == 0 { 1 } else { 0 };
     }
+    crate::verified::tile_rows_for_budget(budget, row_bytes, height)
 }

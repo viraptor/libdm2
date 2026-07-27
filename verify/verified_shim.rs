@@ -12,3 +12,6 @@
 
 #[path = "../src/verified.rs"]
 pub mod verified;
+
+#[path = "../src/verified_lzvn.rs"]
+pub mod verified_lzvn;

@@ -242,26 +242,24 @@ fn encode_default_tile_ycc(pixels: &[u8], w: usize, h: usize, format: PixelForma
         match format {
             PixelFormat::Rgba8 => {
                 for i in 0..w {
-                    let r = row_pixels[i * 4] as i16;
-                    let g = row_pixels[i * 4 + 1] as i16;
-                    let b = row_pixels[i * 4 + 2] as i16;
-                    let co = r - b;
-                    let t = b + co / 2;
-                    let cg = g - t;
-                    cur_y[i] = t + cg / 2;
+                    let (y, co, cg) = verified::ycocg_forward_pixel(
+                        row_pixels[i * 4],
+                        row_pixels[i * 4 + 1],
+                        row_pixels[i * 4 + 2],
+                    );
+                    cur_y[i] = y;
                     cur_co[i] = co;
                     cur_cg[i] = cg;
                 }
             }
             PixelFormat::Rgb8 => {
                 for i in 0..w {
-                    let r = row_pixels[i * 3] as i16;
-                    let g = row_pixels[i * 3 + 1] as i16;
-                    let b = row_pixels[i * 3 + 2] as i16;
-                    let co = r - b;
-                    let t = b + co / 2;
-                    let cg = g - t;
-                    cur_y[i] = t + cg / 2;
+                    let (y, co, cg) = verified::ycocg_forward_pixel(
+                        row_pixels[i * 3],
+                        row_pixels[i * 3 + 1],
+                        row_pixels[i * 3 + 2],
+                    );
+                    cur_y[i] = y;
                     cur_co[i] = co;
                     cur_cg[i] = cg;
                 }

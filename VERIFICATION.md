@@ -79,34 +79,47 @@ Constraints discovered while doing this:
 
 ## What is verified today
 
-`src/verified.rs` is production code (the encode/decode paths call it)
-and carries Verus specs, checked by `./verify.sh`. Current status:
-**20 verified, 0 errors** with Verus `0.2026.07.25.d64f7c4` (the commit
-pinned as `VERUS_GIT_REV` in `verify.sh`):
+`src/verified.rs` and `src/verified_lzvn.rs` are production code (the
+encode/decode paths call them) and carry Verus specs, checked by
+`./verify.sh`. Current status: **38 verified, 0 errors** with Verus
+`0.2026.07.25.d64f7c4` (the commit pinned as `VERUS_GIT_REV` in
+`verify.sh`):
 
 | Item | Property | Proof style |
 |---|---|---|
-| `zigzag_encode`/`zigzag_decode` | mutually inverse on all 2^16 values (bijection) | 16-bit `bit_vector` |
+| `zigzag_encode`/`zigzag_decode` | mutually inverse on all 2^16 values (bijection); implementation equals the arithmetic formula documented in deepmap2.md (`x >= 0 ? 2x : -2x-1`) | 16-bit `bit_vector` |
 | `adjust_residual`/`unadjust_residual` | mutually inverse for every `res > i16::MIN`; unadjust total | linear arithmetic; single-definition style (`#[verifier::allow_in_spec]` + `returns`), so the exec functions are their own spec |
 | `lemma_residual_pipeline_roundtrip` | the full type-2 residual pipeline (adjust → zigzag → unzigzag → unadjust) is the identity | composition |
 | `wrap_add_i16` | two's-complement wrap-around addition, per vstd's trusted `i16_specs::wrapping_add` | vstd spec |
-| `unpredict_none`/`unpredict_left`/`unpredict_up` | elementwise functional postconditions for the three encoder-emitted prediction modes | loop invariants |
+| `unpredict_{none,left,up,upleft,mean}` | elementwise functional postconditions for **all five** documented prediction-mode inversions (2-way Paeth and Mean included), writing through the caller's `&mut [i16]`; `predict::unpredict_row` is now only mode dispatch | loop invariants over mutable slices |
+| `ycocg_forward_pixel`/`ycocg_inverse_pixel` | exact round-trip of the truncating-division YCoCg transform — proved for *all* integer inputs, not just the 8-bit cube — plus output range bounds | linear (Co/Cg pass through; the halved terms cancel) |
+| `tile_rows_for_budget` | tile strip height is in `1..=height` and respects the raw-byte budget unless a single row alone exceeds it (deepmap2.md "Tiling") | vstd div/mod lemmas |
+| `verified_lzvn::decode` | **the production LZVN decoder**: panic-free (all indexing in bounds, no over/underflow), terminating, output length ≤ buffer, buffer length preserved — for arbitrary hostile input | loop invariants + decreases |
 
 Every proved property also has an executable counterpart in
 `tests/verified_props.rs` (exhaustive where the domain allows — all 65536
 zigzag values, the full 2^24 RGB cube for colorspace), so the guarantees
-are enforced by plain `cargo test` on machines without Verus, and the
-verified implementations are pinned against the historical formulas they
-replaced.
+are enforced by plain `cargo test` on machines without Verus. Where a
+verified implementation replaced existing code (all five unpredict modes,
+the LZVN decoder, tile height), the pre-verification implementation is
+kept verbatim in the test file as a reference oracle and
+differential-tested — valid, truncated, bit-flipped, and random streams
+must produce byte-identical results.
 
-The same test file adds hostile-input validation for the tiers that are
-not yet proved: LZVN decode fuzzing (arbitrary bytes, truncations,
-bit-flips, undersized outputs), container-level corruption sweeps, and an
-`dm2_encode_bound` property check. Writing it immediately found two
-tier-1 violations — debug-build overflow panics in the multi-channel
-type-2 decoder on corrupted streams (i16 prediction sums and inverse-YCoCg
+The hostile-input fuzz suite in the same file found two tier-1 violations
+on day one — debug-build overflow panics in the multi-channel type-2
+decoder on corrupted streams (i16 prediction sums and inverse-YCoCg
 intermediates), both fixed on this branch using the verified
 `wrap_add_i16` and i32 widening respectively.
+
+Notes for future proof work in this codebase, learned the hard way:
+truncating `as`-casts and bit-level facts are only exported to the
+`bit_vector`/`compute` solvers (state them in a `by (bit_vector)` assert,
+then let the default solver chain them); a slice view's `len()` is an
+unbounded `nat` inside loop invariants, so carry `dst@.len() <= usize::MAX`
+(or bind an exec `len()`) when index arithmetic must not overflow; and
+keep bit-ops in `u8` and add constants only after casting to `usize`, so
+type bounds make overflow obligations trivial.
 
 ## Build/verify mechanics
 
@@ -130,21 +143,30 @@ intermediates), both fixed on this branch using the verified
 
 ## Roadmap (in rough order of value per effort)
 
-1. **LZVN decoder, tier 1**: prove the decode loop panic-free and in-bounds
-   for arbitrary input (loop invariants over `sp`/`dp`, termination by
-   `src.len() - sp`). Rewrites `copy_literal`/`copy_match` with verified
-   contracts.
-2. **`UpLeft`/`Mean` reconstruction**: extend the verified row functions to
-   the remaining two modes (i32 intermediates are in the supported subset)
-   and converge `predict::unpredict_row` onto them once Verus's `&mut`
-   slice support allows writing through the caller's buffer.
-3. **Colorspace, tier 2**: the truncating-division YCoCg variant, either
-   via `bit_vector` on a division-free reformulation or exhaustive-by-proof
-   over u8 triples. (Currently: exhaustively tested, not proved.)
+1. ~~**LZVN decoder, tier 1**~~ — **done**: `verified_lzvn::decode` is the
+   production decoder, proved panic-free and terminating on arbitrary
+   input.
+2. ~~**`UpLeft`/`Mean` reconstruction**~~ — **done**: all five modes are
+   verified and `predict::unpredict_row` is pure dispatch (Verus's
+   first-class `&mut` slice support made the production signature
+   directly verifiable).
+3. ~~**Colorspace, tier 2**~~ — **done** for the scalar transform used by
+   the encoder (`ycocg_forward_pixel`/`ycocg_inverse_pixel`, round-trip
+   proved for all integers). The decoder's i32-widened clamping loop is
+   intentionally separate (it must accept hostile values) and remains
+   test-covered only.
 4. **Predict→unpredict round-trip, tier 2**: verify the encoder-side
-   residual computation as the inverse of the verified reconstruction.
+   residual computation (`predict_row`'s per-mode residuals) as the exact
+   inverse of the verified reconstruction — the last step to a fully
+   verified type-2 value pipeline.
 5. **`Header::read`/`write`, tiers 1+3**: inverse pair + panic freedom on
-   hostile headers.
-6. **LZVN encoder→decoder round-trip, tier 4**: the long game; would make
+   hostile headers (needs byte-serialization specs for the u16 LE fields
+   and the palette block).
+6. **Decode tile walk, tier 1**: `decode_tiled`'s offset arithmetic over
+   the `[u32 size][data]` framing, closing the last unverified index math
+   between the container and the verified layers.
+7. **LZVN decoder functional spec, tier 2**: strengthen from "safe" to
+   "decodes correctly", giving meaning to the opcode table itself.
+8. **LZVN encoder→decoder round-trip, tier 4**: the long game; would make
    the entire sub-4096-byte tile path (the pure-Rust one) end-to-end
    verified.

@@ -25,19 +25,23 @@ A C ABI is also exported (`dm2_encode`, `dm2_decode`, `dm2_encode_file`, `dm2_de
 
 ## Formal verification (Verus)
 
-The arithmetic core of the type-2 residual pipeline (zigzag coding, the
-negative-residual adjustment, wrap-around prediction sums, and row
-reconstruction for the encoder-emitted modes) lives in
-[`src/verified.rs`](src/verified.rs) and carries
-[Verus](https://github.com/verus-lang/verus) specifications: the round-trip
-properties are machine-checked proofs, not just tests. `cargo build` does
-not need Verus (ghost code erases; `vstd` is an ordinary dependency) — run
-`./verify.sh` to check the proofs. See [VERIFICATION.md](VERIFICATION.md)
-for what is provable in a codec, what is verified today, and the roadmap.
+Substantial parts of the codec are verified with
+[Verus](https://github.com/verus-lang/verus) and the verified code *is*
+the production code: the LZVN decoder
+([`src/verified_lzvn.rs`](src/verified_lzvn.rs) — panic-free and
+terminating on arbitrary hostile input), all five prediction-mode
+inversions, the YCoCg scalar transform (round-trip proved exactly), the
+zigzag/residual coding pipeline (proved a bijection, and equal to the
+formula documented in `deepmap2.md`), and the tile-height budget math
+([`src/verified.rs`](src/verified.rs)). `cargo build` does not need Verus
+(ghost code erases; `vstd` is an ordinary dependency) — run `./verify.sh`
+to check the proofs. See [VERIFICATION.md](VERIFICATION.md) for what is
+provable in a codec, what is verified today, and the roadmap.
 
 The proofs are mirrored by exhaustive/property tests in
-`tests/verified_props.rs` (including hostile-input fuzzing of the decoder
-and LZVN layers) that run with plain `cargo test`.
+`tests/verified_props.rs` (including hostile-input fuzzing and
+differential oracles against the pre-verification implementations) that
+run with plain `cargo test`.
 
 ## Build requirements
 
