@@ -33,6 +33,51 @@ use vstd::prelude::*;
 verus! {
 
 // ---------------------------------------------------------------------
+// Prediction modes (deepmap2.md "Prediction modes")
+//
+// Defined here (rather than in predict.rs, which re-exports) so the
+// specs below can match on the modes directly.
+// ---------------------------------------------------------------------
+
+/// Prediction modes for type 2 (default) compression.
+/// Each mode predicts each pixel from its neighbors; the encoder stores
+/// the signed residual (actual - predicted) which tends to be near zero
+/// for smooth images.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum PredictMode {
+    None = 0,
+    UpLeft = 1,
+    Left = 2,
+    Up = 3,
+    Mean = 4,
+}
+
+impl PredictMode {
+    #[verifier::allow_in_spec]
+    pub fn from_u8(v: u8) -> (r: Option<Self>)
+        returns
+            (match v {
+                0u8 => Some(PredictMode::None),
+                1u8 => Some(PredictMode::UpLeft),
+                2u8 => Some(PredictMode::Left),
+                3u8 => Some(PredictMode::Up),
+                4u8 => Some(PredictMode::Mean),
+                _ => None,
+            }),
+    {
+        match v {
+            0 => Some(Self::None),
+            1 => Some(Self::UpLeft),
+            2 => Some(Self::Left),
+            3 => Some(Self::Up),
+            4 => Some(Self::Mean),
+            _ => None,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------
 // Zigzag coding
 //
 // The production formula (historically written over i32) is
@@ -483,6 +528,319 @@ pub fn unpredict_mean(res: &[i16], prev: &[i16], out: &mut [i16])
 }
 
 // ---------------------------------------------------------------------
+// Gray type-2 row coding: the full verified value pipeline
+//
+// Encoder (per row):  res = value - pred;  adjust (unless mode None);
+//                     zigzag;  split into hi/lo byte planes.
+// Decoder (per row):  reassemble;  unzigzag;  unadjust;  un-predict.
+//
+// `encode_gray_row`/`decode_gray_row` are the production implementations
+// (called from encode.rs/decode.rs), and `lemma_gray_row_roundtrip`
+// proves the decoder recurrence recovers the encoded row **exactly** for
+// every u8-range row and every encoder-emitted mode — making the type-2
+// gray value pipeline verified end-to-end (the LZFSE layer in between is
+// byte-transparent and out of scope).
+// ---------------------------------------------------------------------
+
+/// Splitting a code word into hi/lo bytes and reassembling is the identity.
+pub proof fn lemma_bytes_roundtrip(z: u16)
+    ensures
+        ((((z >> 8) as u8) as u16) << 8) | ((z as u8) as u16) == z,
+{
+    assert(((((z >> 8) as u8) as u16) << 8) | ((z as u8) as u16) == z) by (bit_vector);
+}
+
+/// Spec: the encoder's predictor for the gray modes it emits (None,
+/// Left, Up). Prediction reads the *original* values; losslessness (the
+/// round-trip theorem) is exactly what makes the decoder's reconstructed
+/// context identical.
+pub open spec fn spec_gray_pred(cur: Seq<i16>, prev: Seq<i16>, mode: PredictMode, i: int) -> i16 {
+    match mode {
+        PredictMode::None => 0i16,
+        PredictMode::Left => if i == 0 {
+            0i16
+        } else {
+            cur[i - 1]
+        },
+        _ => prev[i],
+    }
+}
+
+/// Spec: the residual the encoder stores (post-adjustment).
+pub open spec fn spec_gray_residual(
+    cur: Seq<i16>,
+    prev: Seq<i16>,
+    mode: PredictMode,
+    i: int,
+) -> i16 {
+    let raw = (cur[i] - spec_gray_pred(cur, prev, mode, i)) as i16;
+    if mode is None {
+        raw
+    } else {
+        adjust_residual(raw)
+    }
+}
+
+/// Spec: the zigzag code word the encoder stores for position `i`.
+pub open spec fn spec_gray_code(cur: Seq<i16>, prev: Seq<i16>, mode: PredictMode, i: int) -> u16 {
+    spec_zigzag_encode(spec_gray_residual(cur, prev, mode, i) as u16)
+}
+
+/// Spec: the residual the decoder recovers from one hi/lo byte pair.
+pub open spec fn spec_code_residual(hi: u8, lo: u8) -> i16 {
+    unadjust_residual(spec_zigzag_decode(((hi as u16) << 8) | (lo as u16)) as i16)
+}
+
+/// Spec: the decoder's predictor, reading its own reconstruction.
+pub open spec fn spec_gray_dec_pred(
+    out: Seq<i16>,
+    prev: Seq<i16>,
+    mode: PredictMode,
+    i: int,
+) -> i16 {
+    match mode {
+        PredictMode::None => 0i16,
+        PredictMode::Left => if i == 0 {
+            0i16
+        } else {
+            out[i - 1]
+        },
+        _ => prev[i],
+    }
+}
+
+/// Spec: both value-range preconditions of the gray encoder.
+pub open spec fn spec_gray_ranges(cur: Seq<i16>, prev: Seq<i16>) -> bool {
+    &&& forall|j: int| 0 <= j < cur.len() ==> 0 <= #[trigger] cur[j] <= 255
+    &&& forall|j: int| 0 <= j < prev.len() ==> 0 <= #[trigger] prev[j] <= 255
+}
+
+/// Spec: `out` satisfies the decoder recurrence over the bytes the
+/// encoder produced for `cur`/`prev`/`mode`.
+pub open spec fn spec_gray_decode_rel(
+    cur: Seq<i16>,
+    prev: Seq<i16>,
+    mode: PredictMode,
+    out: Seq<i16>,
+) -> bool {
+    forall|j: int|
+        0 <= j < cur.len() ==> #[trigger] out[j] == spec_wrap_add(
+            spec_code_residual(
+                (spec_gray_code(cur, prev, mode, j) >> 8) as u8,
+                spec_gray_code(cur, prev, mode, j) as u8,
+            ),
+            spec_gray_dec_pred(out, prev, mode, j),
+        )
+}
+
+/// Encode one gray row into the hi/lo byte planes (the production
+/// encoder path for 1-channel type 2).
+pub fn encode_gray_row(cur: &[i16], prev: &[i16], mode: PredictMode, hi: &mut [u8], lo: &mut [
+    u8])
+    requires
+        cur@.len() == prev@.len(),
+        old(hi).len() == cur.len(),
+        old(lo).len() == cur.len(),
+        mode is None || mode is Left || mode is Up,
+        spec_gray_ranges(cur@, prev@),
+    ensures
+        final(hi)@.len() == cur@.len(),
+        final(lo)@.len() == cur@.len(),
+        forall|i: int|
+            0 <= i < cur@.len() ==> (#[trigger] final(hi)@[i]) == (spec_gray_code(
+                cur@,
+                prev@,
+                mode,
+                i,
+            ) >> 8) as u8 && final(lo)@[i] == spec_gray_code(cur@, prev@, mode, i) as u8,
+{
+    let mut k: usize = 0;
+    while k < cur.len()
+        invariant
+            cur@.len() == prev@.len(),
+            hi@.len() == cur@.len(),
+            lo@.len() == cur@.len(),
+            k <= cur@.len(),
+            mode is None || mode is Left || mode is Up,
+            spec_gray_ranges(cur@, prev@),
+            forall|i: int|
+                0 <= i < k ==> (#[trigger] hi@[i]) == (spec_gray_code(cur@, prev@, mode, i)
+                    >> 8) as u8 && lo@[i] == spec_gray_code(cur@, prev@, mode, i) as u8,
+        decreases cur@.len() - k,
+    {
+        let pred: i16 = match mode {
+            PredictMode::None => 0,
+            PredictMode::Left => if k == 0 {
+                0
+            } else {
+                cur[k - 1]
+            },
+            _ => prev[k],
+        };
+        let mut res = cur[k] - pred;
+        if !matches!(mode, PredictMode::None) {
+            res = adjust_residual(res);
+        }
+        let z = zigzag_encode(res);
+        hi[k] = (z >> 8) as u8;
+        lo[k] = z as u8;
+        k += 1;
+    }
+}
+
+/// Decode one gray row from the hi/lo byte planes (the production
+/// decoder path for 1-channel type 2). Handles all five modes; returns
+/// false when the mode needs a previous row and there is none (corrupt
+/// stream). For the encoder-emitted modes the postcondition gives the
+/// full decoder recurrence, which `lemma_gray_row_roundtrip` composes
+/// with the encoder's to the identity.
+pub fn decode_gray_row(
+    hi: &[u8],
+    lo: &[u8],
+    prev: Option<&[i16]>,
+    mode: PredictMode,
+    out: &mut [i16],
+) -> (ok: bool)
+    requires
+        hi@.len() == lo@.len(),
+        old(out).len() == hi@.len(),
+        match prev {
+            Some(p) => p@.len() == hi@.len(),
+            None => true,
+        },
+    ensures
+        final(out)@.len() == old(out)@.len(),
+        ok == !((mode is Up || mode is UpLeft || mode is Mean) && prev is None),
+        ok && (mode is None || mode is Left || mode is Up) ==> forall|i: int|
+            0 <= i < hi@.len() ==> (#[trigger] final(out)@[i]) == spec_wrap_add(
+                spec_code_residual(hi@[i], lo@[i]),
+                spec_gray_dec_pred(
+                    final(out)@,
+                    if mode is Up {
+                        prev.unwrap()@
+                    } else {
+                        Seq::empty()
+                    },
+                    mode,
+                    i,
+                ),
+            ),
+{
+    let mut residuals: Vec<i16> = Vec::with_capacity(hi.len());
+    let mut k: usize = 0;
+    while k < hi.len()
+        invariant
+            hi@.len() == lo@.len(),
+            k <= hi@.len(),
+            residuals@.len() == k,
+            forall|i: int|
+                0 <= i < k ==> #[trigger] residuals@[i] == spec_code_residual(hi@[i], lo@[i]),
+        decreases hi@.len() - k,
+    {
+        let z: u16 = ((hi[k] as u16) << 8) | (lo[k] as u16);
+        let d = zigzag_decode(z);
+        proof {
+            assert(((d as u16) as i16) == d) by (bit_vector);
+        }
+        residuals.push(unadjust_residual(d));
+        k += 1;
+    }
+    match mode {
+        PredictMode::None => {
+            unpredict_none(residuals.as_slice(), out);
+            true
+        }
+        PredictMode::Left => {
+            unpredict_left(residuals.as_slice(), out);
+            true
+        }
+        PredictMode::Up => {
+            match prev {
+                Some(p) => {
+                    unpredict_up(residuals.as_slice(), p, out);
+                    true
+                }
+                None => false,
+            }
+        }
+        PredictMode::UpLeft => {
+            match prev {
+                Some(p) => {
+                    unpredict_upleft(residuals.as_slice(), p, out);
+                    true
+                }
+                None => false,
+            }
+        }
+        PredictMode::Mean => {
+            match prev {
+                Some(p) => {
+                    unpredict_mean(residuals.as_slice(), p, out);
+                    true
+                }
+                None => false,
+            }
+        }
+    }
+}
+
+/// Induction step for the round-trip theorem: element `i` of the decoded
+/// row equals element `i` of the encoded row.
+proof fn lemma_gray_row_roundtrip_at(
+    cur: Seq<i16>,
+    prev: Seq<i16>,
+    mode: PredictMode,
+    out: Seq<i16>,
+    i: int,
+)
+    requires
+        mode is None || mode is Left || mode is Up,
+        prev.len() == cur.len(),
+        out.len() == cur.len(),
+        spec_gray_ranges(cur, prev),
+        spec_gray_decode_rel(cur, prev, mode, out),
+        0 <= i < cur.len(),
+    ensures
+        out[i] == cur[i],
+    decreases i,
+{
+    let z = spec_gray_code(cur, prev, mode, i);
+    lemma_bytes_roundtrip(z);
+    let res = spec_gray_residual(cur, prev, mode, i);
+    lemma_zigzag_roundtrip_signed(res);
+    let raw = (cur[i] - spec_gray_pred(cur, prev, mode, i)) as i16;
+    if !(mode is None) {
+        lemma_adjust_roundtrip(raw);
+    }
+    if mode is Left && i > 0 {
+        lemma_gray_row_roundtrip_at(cur, prev, mode, out, i - 1);
+    }
+}
+
+/// **The round-trip theorem for gray type-2 rows**: any reconstruction
+/// satisfying the decoder recurrence over the encoder's bytes equals the
+/// original row exactly, for every u8-range row and every encoder mode.
+pub proof fn lemma_gray_row_roundtrip(
+    cur: Seq<i16>,
+    prev: Seq<i16>,
+    mode: PredictMode,
+    out: Seq<i16>,
+)
+    requires
+        mode is None || mode is Left || mode is Up,
+        prev.len() == cur.len(),
+        out.len() == cur.len(),
+        spec_gray_ranges(cur, prev),
+        spec_gray_decode_rel(cur, prev, mode, out),
+    ensures
+        out =~= cur,
+{
+    assert forall|i: int| 0 <= i < cur.len() implies out[i] == cur[i] by {
+        lemma_gray_row_roundtrip_at(cur, prev, mode, out, i);
+    }
+}
+
+// ---------------------------------------------------------------------
 // YCoCg color transform (deepmap2.md "Color transform")
 //
 //   Forward:  Co = R - B;  t = B + Co/2;  Cg = G - t;  Y = t + Cg/2
@@ -586,6 +944,70 @@ pub fn ycocg_inverse_pixel(y: i16, co: i16, cg: i16) -> (out: (i16, i16, i16))
     let b: i16 = t - div2_trunc(co);
     let r: i16 = co + b;
     (r, g, b)
+}
+
+/// Spec: clamp an integer into the u8 range.
+pub open spec fn spec_clamp_u8(x: int) -> int {
+    if x < 0 {
+        0
+    } else if x > 255 {
+        255
+    } else {
+        x
+    }
+}
+
+/// Clamp an i32 into u8 (the decoder's saturation step).
+fn clamp_u8_i32(v: i32) -> (r: u8)
+    ensures
+        r as int == spec_clamp_u8(v as int),
+{
+    if v < 0 {
+        0
+    } else if v > 255 {
+        255
+    } else {
+        v as u8
+    }
+}
+
+/// Total inverse YCoCg with clamping — the production per-pixel inverse
+/// of the type-2 RGB/RGBA decoder. Computed in i32 (matching C integer
+/// promotion in Apple's decoder) so it is safe for *hostile* Y/Co/Cg
+/// values, then saturated to u8.
+pub fn ycocg_inverse_clamped(y: i16, co: i16, cg: i16) -> (out: (u8, u8, u8))
+    ensures
+        out.0 as int == spec_clamp_u8(spec_ycocg_inverse(y as int, co as int, cg as int).0),
+        out.1 as int == spec_clamp_u8(spec_ycocg_inverse(y as int, co as int, cg as int).1),
+        out.2 as int == spec_clamp_u8(spec_ycocg_inverse(y as int, co as int, cg as int).2),
+{
+    let yw = y as i32;
+    let cow = co as i32;
+    let cgw = cg as i32;
+    let t = yw - cgw / 2;
+    let g = cgw + t;
+    let b = t - cow / 2;
+    let r = cow + b;
+    (clamp_u8_i32(r), clamp_u8_i32(g), clamp_u8_i32(b))
+}
+
+/// For YCoCg triples produced by the forward transform of an 8-bit
+/// pixel, the clamped inverse is exact: composition of the round-trip
+/// theorem with clamp-identity on in-range values.
+pub proof fn lemma_ycocg_clamped_roundtrip(r: int, g: int, b: int)
+    requires
+        0 <= r <= 255,
+        0 <= g <= 255,
+        0 <= b <= 255,
+    ensures
+        ({
+            let (y, co, cg) = spec_ycocg_forward(r, g, b);
+            &&& spec_clamp_u8(spec_ycocg_inverse(y, co, cg).0) == r
+            &&& spec_clamp_u8(spec_ycocg_inverse(y, co, cg).1) == g
+            &&& spec_clamp_u8(spec_ycocg_inverse(y, co, cg).2) == b
+        }),
+{
+    lemma_ycocg_roundtrip(r, g, b);
 }
 
 // ---------------------------------------------------------------------

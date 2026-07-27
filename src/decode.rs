@@ -153,7 +153,6 @@ fn decode_default_tile(tile_data: &[u8], pixels: &mut [u8], w: usize, h: usize, 
 
     let mut cur = vec![0i16; w];
     let mut prev = vec![0i16; w];
-    let mut residuals = vec![0i16; w];
 
     for row in 0..h {
         let mode_byte = *decompressed.get(row).ok_or(Dm2Error::DecodeFailed)?;
@@ -163,13 +162,15 @@ fn decode_default_tile(tile_data: &[u8], pixels: &mut [u8], w: usize, h: usize, 
         let low_plane = h + plane + row * w;
         let high = decompressed.get(high_plane..high_plane + w).ok_or(Dm2Error::DecodeFailed)?;
         let low = decompressed.get(low_plane..low_plane + w).ok_or(Dm2Error::DecodeFailed)?;
-        for i in 0..w {
-            let z = ((high[i] as u16) << 8) | (low[i] as u16);
-            residuals[i] = verified::unadjust_residual(predict::zigzag_decode(z));
-        }
 
+        // Verified row decode: zigzag + un-adjustment + inverse
+        // prediction (see verified::lemma_gray_row_roundtrip). `false`
+        // means the mode needs a previous row and this is row 0 —
+        // a corrupt header, not a panic.
         let prev_ref = if row > 0 { Some(prev.as_slice()) } else { None };
-        predict::unpredict_row(&residuals, prev_ref, mode, &mut cur)?;
+        if !verified::decode_gray_row(high, low, prev_ref, mode, &mut cur) {
+            return Err(Dm2Error::DecodeFailed);
+        }
 
         let row_pixels = &mut pixels[row * w..(row + 1) * w];
         for i in 0..w {
@@ -305,37 +306,27 @@ fn decode_default_tile_ycc(tile_data: &[u8], pixels: &mut [u8], w: usize, h: usi
         let row_pixels = &mut pixels[row * w * ps..(row + 1) * w * ps];
 
         match format {
-            // The inverse YCoCg math is done in i32: C integer promotion
-            // means Apple's decoder computes these in `int` too, and with
-            // hostile residuals the intermediate values can exceed i16
-            // (plain i16 `+`/`-` here panics debug builds — found by
-            // tests/verified_props.rs). i32 cannot overflow: |inputs| ≤
-            // 32768 and the expression depth is small.
+            // The inverse YCoCg is the verified total function
+            // ycocg_inverse_clamped: i32-widened (matching C integer
+            // promotion in Apple's decoder, and safe for hostile
+            // residuals — plain i16 math here used to panic debug
+            // builds), saturating to u8. For encoder-produced values it
+            // is exact (verified::lemma_ycocg_clamped_roundtrip).
             PixelFormat::Rgba8 => {
                 for i in 0..w {
-                    let co = cur_co[i] as i32;
-                    let cg = cur_cg[i] as i32;
-                    let t = cur_y[i] as i32 - cg / 2;
-                    let g = cg + t;
-                    let b = t - co / 2;
-                    let r = co + b;
-                    row_pixels[i * 4] = r.clamp(0, 255) as u8;
-                    row_pixels[i * 4 + 1] = g.clamp(0, 255) as u8;
-                    row_pixels[i * 4 + 2] = b.clamp(0, 255) as u8;
+                    let (r, g, b) = verified::ycocg_inverse_clamped(cur_y[i], cur_co[i], cur_cg[i]);
+                    row_pixels[i * 4] = r;
+                    row_pixels[i * 4 + 1] = g;
+                    row_pixels[i * 4 + 2] = b;
                     row_pixels[i * 4 + 3] = buf[row * w + i];
                 }
             }
             PixelFormat::Rgb8 => {
                 for i in 0..w {
-                    let co = cur_co[i] as i32;
-                    let cg = cur_cg[i] as i32;
-                    let t = cur_y[i] as i32 - cg / 2;
-                    let g = cg + t;
-                    let b = t - co / 2;
-                    let r = co + b;
-                    row_pixels[i * 3] = r.clamp(0, 255) as u8;
-                    row_pixels[i * 3 + 1] = g.clamp(0, 255) as u8;
-                    row_pixels[i * 3 + 2] = b.clamp(0, 255) as u8;
+                    let (r, g, b) = verified::ycocg_inverse_clamped(cur_y[i], cur_co[i], cur_cg[i]);
+                    row_pixels[i * 3] = r;
+                    row_pixels[i * 3 + 1] = g;
+                    row_pixels[i * 3 + 2] = b;
                 }
             }
             PixelFormat::GrayA8 => {

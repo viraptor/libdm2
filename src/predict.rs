@@ -1,30 +1,8 @@
-/// Prediction modes for type 2 (default) compression.
-/// Each mode predicts each pixel from its neighbors; the encoder stores
-/// the signed residual (actual - predicted) which tends to be near zero
-/// for smooth images.
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[repr(u8)]
-pub enum PredictMode {
-    None = 0,
-    UpLeft = 1,
-    Left = 2,
-    Up = 3,
-    Mean = 4,
-}
-
-impl PredictMode {
-    pub fn from_u8(v: u8) -> Option<Self> {
-        match v {
-            0 => Some(Self::None),
-            1 => Some(Self::UpLeft),
-            2 => Some(Self::Left),
-            3 => Some(Self::Up),
-            4 => Some(Self::Mean),
-            _ => None,
-        }
-    }
-}
+/// Prediction for type 2 (default) compression. The `PredictMode` enum
+/// and all row-reconstruction code live in [`crate::verified`] with
+/// Verus-checked specifications; this module re-exports the type and
+/// keeps the (float-based, correctness-irrelevant) encoder heuristic.
+pub use crate::verified::PredictMode;
 
 fn cost(residuals: &[i16]) -> f32 {
     residuals.iter().map(|&r| (r as f32).abs()).sum()

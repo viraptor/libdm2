@@ -29,10 +29,14 @@ Substantial parts of the codec are verified with
 [Verus](https://github.com/verus-lang/verus) and the verified code *is*
 the production code: the LZVN decoder
 ([`src/verified_lzvn.rs`](src/verified_lzvn.rs) — panic-free and
-terminating on arbitrary hostile input), all five prediction-mode
-inversions, the YCoCg scalar transform (round-trip proved exactly), the
-zigzag/residual coding pipeline (proved a bijection, and equal to the
-formula documented in `deepmap2.md`), and the tile-height budget math
+terminating on arbitrary hostile input), the gray type-2 row coders with
+a machine-checked **round-trip theorem** (`lemma_gray_row_roundtrip`:
+decode ∘ encode is the identity over the actual byte planes, so the gray
+value pipeline is verified end-to-end modulo the byte-transparent LZFSE
+layer), all five prediction-mode inversions, the YCoCg transform (exact
+round-trip, plus the decoder's total clamped inverse), the
+zigzag/residual coding (proved a bijection, and equal to the formula
+documented in `deepmap2.md`), and the tile-height budget math
 ([`src/verified.rs`](src/verified.rs)). `cargo build` does not need Verus
 (ghost code erases; `vstd` is an ordinary dependency) — run `./verify.sh`
 to check the proofs. See [VERIFICATION.md](VERIFICATION.md) for what is

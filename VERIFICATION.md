@@ -81,7 +81,7 @@ Constraints discovered while doing this:
 
 `src/verified.rs` and `src/verified_lzvn.rs` are production code (the
 encode/decode paths call them) and carry Verus specs, checked by
-`./verify.sh`. Current status: **38 verified, 0 errors** with Verus
+`./verify.sh`. Current status: **52 verified, 0 errors** with Verus
 `0.2026.07.25.d64f7c4` (the commit pinned as `VERUS_GIT_REV` in
 `verify.sh`):
 
@@ -95,6 +95,10 @@ encode/decode paths call them) and carry Verus specs, checked by
 | `ycocg_forward_pixel`/`ycocg_inverse_pixel` | exact round-trip of the truncating-division YCoCg transform — proved for *all* integer inputs, not just the 8-bit cube — plus output range bounds | linear (Co/Cg pass through; the halved terms cancel) |
 | `tile_rows_for_budget` | tile strip height is in `1..=height` and respects the raw-byte budget unless a single row alone exceeds it (deepmap2.md "Tiling") | vstd div/mod lemmas |
 | `verified_lzvn::decode` | **the production LZVN decoder**: panic-free (all indexing in bounds, no over/underflow), terminating, output length ≤ buffer, buffer length preserved — for arbitrary hostile input | loop invariants + decreases |
+| `encode_gray_row`/`decode_gray_row` | the production gray type-2 row coders: full functional postconditions (predict → adjust → zigzag → hi/lo byte split, and its inverse); the decoder is total on hostile bytes | loop invariants |
+| **`lemma_gray_row_roundtrip`** | **the row round-trip theorem**: for every u8-range row and every encoder-emitted mode, the decoder recurrence over the encoder's bytes reconstructs the row *exactly* — the gray type-2 value pipeline is verified end-to-end (LZFSE in between is byte-transparent) | induction composing the byte-split, zigzag, adjustment, and wrap-add lemmas |
+| `ycocg_inverse_clamped` | the production per-pixel inverse for RGB/RGBA type-2 decode: total on hostile values (i32-widened, saturating), and exact on encoder-produced values (`lemma_ycocg_clamped_roundtrip`) | linear + clamp identity |
+| `PredictMode::from_u8` | mode-byte parsing, single-definition style | `allow_in_spec` |
 
 Every proved property also has an executable counterpart in
 `tests/verified_props.rs` (exhaustive where the domain allows — all 65536
@@ -155,10 +159,14 @@ type bounds make overflow obligations trivial.
    proved for all integers). The decoder's i32-widened clamping loop is
    intentionally separate (it must accept hostile values) and remains
    test-covered only.
-4. **Predict→unpredict round-trip, tier 2**: verify the encoder-side
-   residual computation (`predict_row`'s per-mode residuals) as the exact
-   inverse of the verified reconstruction — the last step to a fully
-   verified type-2 value pipeline.
+4. ~~**Predict→unpredict round-trip, tier 2**~~ — **done** for the gray
+   pipeline: `lemma_gray_row_roundtrip` proves decode ∘ encode is the
+   identity at the row level, over the actual hi/lo byte planes, for all
+   encoder-emitted modes, and the production row coders carry the specs
+   it composes. Multi-channel rows currently only use mode 0 (None) plus
+   the proved YCoCg/residual scalar round-trips; extending the row
+   theorem to the interleaved multi-channel layout is the natural next
+   increment.
 5. **`Header::read`/`write`, tiers 1+3**: inverse pair + panic freedom on
    hostile headers (needs byte-serialization specs for the u16 LE fields
    and the palette block).

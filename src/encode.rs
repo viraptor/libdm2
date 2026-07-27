@@ -1,7 +1,7 @@
 use crate::error::{Dm2Error, Result};
 use crate::format::*;
 use crate::lzfse;
-use crate::predict::{self, PredictMode};
+use crate::predict;
 use crate::verified;
 
 pub fn encode(pixels: &[u8], info: &ImageInfo, compression: Compression) -> Result<Vec<u8>> {
@@ -177,29 +177,28 @@ fn encode_default_tile_gray(pixels: &[u8], w: usize, h: usize, format: PixelForm
     let mut residuals = vec![0i16; w];
     let mut scratch = vec![0i16; w];
 
+    // Layout: [h mode bytes][h*w high bytes][h*w low bytes] (+ padding).
+    let (head, lo_plane) = buf.split_at_mut(h + w * h);
+    let (mode_bytes, hi_plane) = head.split_at_mut(h);
+
     for row in 0..h {
         let row_pixels = &pixels[row * w..(row + 1) * w];
         for i in 0..w { cur[i] = row_pixels[i] as i16; }
 
         let prev_ref = if row > 0 { Some(prev.as_slice()) } else { None };
+        // predict_row only selects None, Left, or Up for gray; the row
+        // coding itself is the verified pipeline (see
+        // verified::lemma_gray_row_roundtrip for the round-trip theorem).
         let mode = predict::predict_row(&cur, prev_ref, &mut residuals, &mut scratch);
-        buf[row] = mode as u8;
+        mode_bytes[row] = mode as u8;
 
-        for i in 0..w {
-            // predict_row only selects None, Left, or Up for gray
-            let pred = match mode {
-                PredictMode::None => 0i16,
-                PredictMode::Left => if i == 0 { 0 } else { cur[i - 1] },
-                _ => prev[i],
-            };
-            let mut res = cur[i] - pred;
-            if mode != PredictMode::None {
-                res = verified::adjust_residual(res);
-            }
-            let z = predict::zigzag_encode(res);
-            buf[h + row * w + i] = (z >> 8) as u8;
-            buf[h + w * h + row * w + i] = z as u8;
-        }
+        verified::encode_gray_row(
+            &cur,
+            &prev,
+            mode,
+            &mut hi_plane[row * w..(row + 1) * w],
+            &mut lo_plane[row * w..(row + 1) * w],
+        );
 
         std::mem::swap(&mut cur, &mut prev);
     }

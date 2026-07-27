@@ -221,6 +221,53 @@ fn unpredict_verified_matches_reference_all_modes() {
 }
 
 // ---------------------------------------------------------------------
+// Gray row coding: executable mirror of verified::lemma_gray_row_roundtrip
+// (decode ∘ encode == id for u8-range rows, all encoder modes), plus
+// hostile-input totality of decode_gray_row.
+// ---------------------------------------------------------------------
+
+#[test]
+fn gray_row_roundtrip_executable() {
+    let mut rng = Rng::new(0x9147);
+    for trial in 0..3000 {
+        let w = 1 + rng.below(48);
+        let cur: Vec<i16> = (0..w).map(|_| rng.byte() as i16).collect();
+        let prev: Vec<i16> = (0..w).map(|_| rng.byte() as i16).collect();
+        for mode in [PredictMode::None, PredictMode::Left, PredictMode::Up] {
+            let mut hi = vec![0u8; w];
+            let mut lo = vec![0u8; w];
+            verified::encode_gray_row(&cur, &prev, mode, &mut hi, &mut lo);
+            let mut out = vec![0i16; w];
+            assert!(verified::decode_gray_row(&hi, &lo, Some(&prev), mode, &mut out));
+            assert_eq!(out, cur, "{mode:?} trial={trial}");
+        }
+    }
+}
+
+#[test]
+fn decode_gray_row_hostile_bytes_total() {
+    let mut rng = Rng::new(0x707a1);
+    for _ in 0..5000 {
+        let w = 1 + rng.below(32);
+        let hi: Vec<u8> = (0..w).map(|_| rng.byte()).collect();
+        let lo: Vec<u8> = (0..w).map(|_| rng.byte()).collect();
+        let prev: Vec<i16> = (0..w).map(|_| rng.next() as i16).collect();
+        let mut out = vec![0i16; w];
+        for mode_byte in 0..=4u8 {
+            let mode = PredictMode::from_u8(mode_byte).unwrap();
+            // With a previous row: always succeeds, never panics.
+            assert!(verified::decode_gray_row(&hi, &lo, Some(&prev), mode, &mut out));
+            // Without: fails cleanly exactly for the prev-needing modes.
+            let expect_ok = matches!(mode, PredictMode::None | PredictMode::Left);
+            assert_eq!(
+                verified::decode_gray_row(&hi, &lo, None, mode, &mut out),
+                expect_ok
+            );
+        }
+    }
+}
+
+// ---------------------------------------------------------------------
 // Verified YCoCg scalar transform (used by the type-2 encoder): the
 // roundtrip is proved in verified.rs; here we pin it executably over the
 // full 8-bit cube and against the reference formulas from deepmap2.md.
