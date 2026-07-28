@@ -437,3 +437,94 @@ fn cross_palette_rgba8() {
     let info = ImageInfo { width: 32, height: 32, format: PixelFormat::Rgba8 };
     check_pair(&api, "palette_single", &one, &info, Compression::Palette);
 }
+
+// --- Real-catalog payloads: decode actual Apple-produced deepmap2 streams from a .car with
+// BOTH Apple's vImageDeepmap2Decode and libdm2, and compare RAW output. This isolates the
+// CODEC (payload -> pixels) from any higher-level CUICatalog compositing/colour-management:
+// if libdm2 matches vImageDeepmap2Decode here, libdm2 is correct and any app-level mismatch
+// is elsewhere; if it diverges, this pinpoints the libdm2 decode bug.
+
+fn le32(d: &[u8], o: usize) -> u32 {
+    u32::from_le_bytes([d[o], d[o + 1], d[o + 2], d[o + 3]])
+}
+
+/// Extract every deepmap2 RGBA8 rendition: (label, width, height, payload).
+/// width/height come from the enclosing CSI header (@12/@16); the payload is the dmp2 stream.
+fn car_deepmap2_rgba8(car: &[u8]) -> Vec<(String, u32, u32, Vec<u8>)> {
+    let mut out = Vec::new();
+    let mlec = b"MLEC";
+    let mut i = 0usize;
+    while i + 32 < car.len() {
+        if &car[i..i + 4] != mlec { i += 1; continue; }
+        let comp = le32(car, i + 8);
+        let pay_len = le32(car, i + 24) as usize;
+        if comp != 11 || i + 32 + pay_len > car.len() { i += 4; continue; }
+        let pay = &car[i + 32..i + 32 + pay_len];
+        if pay.len() < 8 || &pay[0..4] != b"dmp2" || pay[7] != 4 /* RGBA8 */ { i += 4; continue; }
+        // full dims from the CSI header preceding this MLEC
+        let istc = car[..i].windows(4).rposition(|w| w == b"ISTC");
+        if let Some(istc) = istc {
+            let w = le32(car, istc + 12);
+            let h = le32(car, istc + 16);
+            if w > 0 && h > 0 && w <= 16384 && h <= 16384 {
+                out.push((format!("MLEC@0x{i:x} {w}x{h}"), w, h, pay.to_vec()));
+            }
+        }
+        i += 32 + pay_len;
+    }
+    out
+}
+
+/// #128 reproduction / ground-truth harness. Decodes the REAL deepmap2 streams Apple shipped in
+/// a .car with both `vImageDeepmap2Decode` and libdm2, comparing raw RGBA. Decoding a fixed stream
+/// is deterministic, so a correct libdm2 must match Apple byte-for-byte. Currently it does NOT for
+/// some renditions (Δ up to ~91, accumulating in predicted runs) — a libdm2 Default/type-2
+/// reconstruction bug; ruled out: YCoCg /2-vs->>1, and dropping/None-gating the negative-residual
+/// adjustment (all leave the divergence unchanged or worse).
+/// `#[ignore]`d because it depends on a host .car path and tracks the open #128 gap; run on demand:
+///   cargo test --release -- --ignored cross_real_car_payloads --nocapture
+/// When #128 is fixed this goes green and the attribute should be removed.
+#[test]
+#[ignore = "reproduces libdm2 decode divergence from vImageDeepmap2Decode on some real streams"]
+fn cross_real_car_payloads() {
+    let Some(api) = apple_api() else {
+        eprintln!("vImageDeepmap2 symbols not resolvable; skipping");
+        return;
+    };
+    let path = std::env::var("COMPARE_CAR").expect("Provide a COMPARE_CAR variable");
+    let Ok(car) = std::fs::read(&path) else {
+        eprintln!("cannot read {path}; skipping");
+        return;
+    };
+    let samples = car_deepmap2_rgba8(&car);
+    assert!(!samples.is_empty(), "no deepmap2 RGBA8 renditions found in {path}");
+
+    let mut fails = 0;
+    for (label, w, h, pay) in &samples {
+        let info = ImageInfo { width: *w, height: *h, format: PixelFormat::Rgba8 };
+        // Apple's raw decode (ground truth).
+        let Some(apple) = apple_decode(&api, pay, &info) else {
+            eprintln!("[{label}] apple decode returned NULL; skipping"); continue;
+        };
+        // Our decode.
+        let mut ours = vec![0u8; (*w as usize) * (*h as usize) * 4];
+        let mut di = ImageInfo { width: 0, height: 0, format: PixelFormat::Gray8 };
+        if let Err(e) = dm2_decode(pay, &mut ours, &mut di) {
+            eprintln!("[{label}] OUR decode failed: {e}"); fails += 1; continue;
+        }
+        let err = maxerr(&apple, &ours);
+        // locate first divergence
+        let first = apple.iter().zip(ours.iter()).position(|(a, b)| a != b);
+        if err == 0 {
+            eprintln!("[{label}] EXACT match vs vImageDeepmap2Decode");
+        } else {
+            fails += 1;
+            let fp = first.unwrap_or(0);
+            let px = fp / 4;
+            eprintln!("[{label}] DIVERGES maxerr={err}  first@byte {fp} (px {},{} chan {})  apple={:?} ours={:?}",
+                px % *w as usize, px / *w as usize, fp % 4,
+                &apple[fp..(fp + 4).min(apple.len())], &ours[fp..(fp + 4).min(ours.len())]);
+        }
+    }
+    assert_eq!(fails, 0, "{fails}/{} real deepmap2 payloads diverge from vImageDeepmap2Decode", samples.len());
+}
