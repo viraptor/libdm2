@@ -88,6 +88,24 @@ fn apple_encode(
     info: &ImageInfo,
     compression: Compression,
 ) -> Option<Vec<u8>> {
+    apple_encode_opts(
+        api,
+        pixels,
+        info,
+        compression,
+        0,
+        if info.format.is_16bit() { 12 } else { 0 },
+    )
+}
+
+fn apple_encode_opts(
+    api: &AppleApi,
+    pixels: &[u8],
+    info: &ImageInfo,
+    compression: Compression,
+    quality: u32,
+    param: u32,
+) -> Option<Vec<u8>> {
     let row_bytes = info.width as usize * info.format.pixel_size();
     let mut src_copy = pixels.to_vec();
     let mut buf = VImageBuffer {
@@ -98,8 +116,8 @@ fn apple_encode(
     };
     let mut opts = Deepmap2Options {
         compression_type: compression as u32,
-        quality: 0,
-        param: if info.format.is_16bit() { 12 } else { 0 },
+        quality,
+        param,
     };
     let cap = pixels.len() * 4 + 4096;
     let mut out = vec![0u8; cap];
@@ -322,7 +340,10 @@ fn run_format(fmt: PixelFormat) {
         return;
     };
     let compressions: &[Compression] = if fmt.is_16bit() {
-        // Per deepmap2.md, only Lossless works correctly for 16-bit.
+        // check_pair starts from OUR encoder, and we only implement
+        // Lossless for 16-bit (Apple's 16-bit type 2 is a lossy fixed-
+        // point scheme we don't encode). Decode of Apple-encoded RGBA16
+        // type 2 is covered by cross_rgba16_default below.
         &[Compression::Lossless]
     } else {
         &[
@@ -412,6 +433,121 @@ fn cross_default_varying_alpha() {
     }
 }
 
+/// Chroma-scale rule (found while adding RGBA16, #128): the half-scale-chroma
+/// switch in type 2 is the QUALITY byte, not param — param provably has no
+/// effect on 8-bit streams (q1/p0 and q1/p10 encode byte-identically). Every
+/// real .car rendition ships (quality=1, param=10), so a param-keyed decoder
+/// passed the real-corpus differential but mis-decoded q0/p10 and q1/p0
+/// streams. Lock decoder equality across the full (quality, param) grid.
+#[test]
+fn cross_default_quality_param_grid() {
+    let Some(api) = apple_api() else { return };
+    for &fmt in &[PixelFormat::GrayA8, PixelFormat::Rgb8, PixelFormat::Rgba8] {
+        let (w, h) = (32u32, 32u32);
+        let pixels = random(w, h, fmt, 0xC0FFEE);
+        let info = ImageInfo { width: w, height: h, format: fmt };
+        for quality in 0..=1u32 {
+            for param in [0u32, 10] {
+                let label = format!("quality_param_grid/{fmt:?}/q{quality}p{param}");
+                let Some(enc) =
+                    apple_encode_opts(&api, &pixels, &info, Compression::Default, quality, param)
+                else {
+                    panic!("[{label}] apple encode rejected input");
+                };
+                let apple = apple_decode(&api, &enc, &info)
+                    .unwrap_or_else(|| panic!("[{label}] apple decode of its own encode is NULL"));
+                let mut ours = vec![0u8; pixels.len()];
+                let mut di = ImageInfo { width: 0, height: 0, format: PixelFormat::Gray8 };
+                dm2_decode(&enc, &mut ours, &mut di)
+                    .unwrap_or_else(|e| panic!("[{label}] our decode failed: {e}"));
+                assert_eq!(
+                    maxerr(&apple, &ours),
+                    0,
+                    "[{label}] our decode diverges from vImageDeepmap2Decode"
+                );
+            }
+        }
+    }
+}
+
+/// Generate an RGBA16 image of VALID half-float pixels with |value| < 4.0
+/// (exponent field <= 16), the amplitude regime real .car EDR icons live in
+/// (known sample peak is ~1.0; codes stay far below the i16 fixed-point limit
+/// at every legal param). Raw byte-noise generators produce NaN/Inf/huge
+/// halfs whose fixed-point codes overflow i16 inside Apple's ENCODER —
+/// see the doc comment on cross_rgba16_default_decoder_equality.
+fn sane_halfs_rgba16(w: u32, h: u32, seed: u64) -> Vec<u8> {
+    let n = w as usize * h as usize * 4;
+    let mut p = Vec::with_capacity(n * 2);
+    let mut s = seed.wrapping_mul(0x9E3779B97F4A7C15);
+    for _ in 0..n {
+        s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        let r = (s >> 40) as u32;
+        let sign = ((r >> 16) & 1) as u16;
+        let exp = ((r >> 10) % 17) as u16; // 0..=16 -> |v| < 4.0 (incl. subnormals)
+        let mant = (r & 0x3ff) as u16;
+        let half = (sign << 15) | (exp << 10) | mant;
+        p.extend_from_slice(&half.to_le_bytes());
+    }
+    p
+}
+
+/// RGBA16 type 2 (#128): Apple encodes 16-bit pixels as fixed-point codes of
+/// the half-float channel values (scale 2^(param-1), param 9..=12) in the
+/// same K=7 plane layout as RGBA8, with an 8-bit alpha plane. Encoding is
+/// lossy, so round-tripping against the ORIGINAL pixels is meaningless —
+/// the contract is decoder equality: for the same stream, our decode must be
+/// byte-identical to vImageDeepmap2Decode. Covers every legal param and both
+/// legal qualities.
+///
+/// Input domain: valid halfs, |v| < 4.0. When a garbage half (NaN/Inf/2^13)
+/// meets the fixed-point quantizer, Apple's encoder WRAPS the code at i16 and
+/// its decoder's wrapping arithmetic becomes observable; we pin the dominant
+/// wrap semantics (i16-wrapping prediction + inverse transform, verified on
+/// q1 all params + q0 p9 even for garbage inputs), but q0/p10..12 streams
+/// built from garbage halfs still diverge on a handful of wrapped pixels —
+/// an intentionally unchased corner: Apple's own encode of such input is
+/// already total value corruption, and no real encoder emits it (every .car
+/// rendition observed is quality=1 param=10 with |v| ~<= 1).
+#[test]
+fn cross_rgba16_default_decoder_equality() {
+    let Some(api) = apple_api() else { return };
+    let fmt = PixelFormat::Rgba16;
+    let sizes: &[(u32, u32)] = &[(16, 16), (33, 17), (64, 64), (128, 9), (1, 64), (64, 1), (256, 2200)];
+    let mut samples: Vec<(String, u32, u32, Vec<u8>)> = Vec::new();
+    for &(w, h) in sizes {
+        samples.push((format!("halfs_{w}x{h}"), w, h, sane_halfs_rgba16(w, h, (w as u64) << 20 | h as u64)));
+    }
+    samples.push(("solid0_32x32".into(), 32, 32, solid(32, 32, fmt, 0)));
+    for (name, w, h, pixels) in samples {
+        let info = ImageInfo { width: w, height: h, format: fmt };
+        for param in 9..=12u32 {
+            for quality in 0..=1u32 {
+                let label = format!("rgba16_default/{name}/q{quality}p{param}");
+                let Some(enc) =
+                    apple_encode_opts(&api, &pixels, &info, Compression::Default, quality, param)
+                else {
+                    // Apple rejects some shapes (e.g. tiny images); nothing to compare.
+                    eprintln!("[{label}] apple encode rejected input; skipping");
+                    continue;
+                };
+                let apple = apple_decode(&api, &enc, &info)
+                    .unwrap_or_else(|| panic!("[{label}] apple decode of its own encode is NULL"));
+                let mut ours = vec![0u8; pixels.len()];
+                let mut di = ImageInfo { width: 0, height: 0, format: PixelFormat::Gray8 };
+                dm2_decode(&enc, &mut ours, &mut di)
+                    .unwrap_or_else(|e| panic!("[{label}] our decode failed: {e}"));
+                assert_eq!(di.format, fmt, "[{label}] format mismatch");
+                assert_eq!(
+                    maxerr(&apple, &ours),
+                    0,
+                    "[{label}] our decode diverges from vImageDeepmap2Decode"
+                );
+            }
+        }
+    }
+}
+
 #[test]
 fn cross_palette_rgba8() {
     let Some(api) = apple_api() else { return };
@@ -448,9 +584,9 @@ fn le32(d: &[u8], o: usize) -> u32 {
     u32::from_le_bytes([d[o], d[o + 1], d[o + 2], d[o + 3]])
 }
 
-/// Extract every deepmap2 RGBA8 rendition: (label, width, height, payload).
+/// Extract every deepmap2 rendition of pixel format `fmt`: (label, width, height, payload).
 /// width/height come from the enclosing CSI header (@12/@16); the payload is the dmp2 stream.
-fn car_deepmap2_rgba8(car: &[u8]) -> Vec<(String, u32, u32, Vec<u8>)> {
+fn car_deepmap2(car: &[u8], fmt: PixelFormat) -> Vec<(String, u32, u32, Vec<u8>)> {
     let mut out = Vec::new();
     let mlec = b"MLEC";
     let mut i = 0usize;
@@ -460,7 +596,7 @@ fn car_deepmap2_rgba8(car: &[u8]) -> Vec<(String, u32, u32, Vec<u8>)> {
         let pay_len = le32(car, i + 24) as usize;
         if comp != 11 || i + 32 + pay_len > car.len() { i += 4; continue; }
         let pay = &car[i + 32..i + 32 + pay_len];
-        if pay.len() < 8 || &pay[0..4] != b"dmp2" || pay[7] != 4 /* RGBA8 */ { i += 4; continue; }
+        if pay.len() < 8 || &pay[0..4] != b"dmp2" || pay[7] != fmt as u8 { i += 4; continue; }
         // full dims from the CSI header preceding this MLEC
         let istc = car[..i].windows(4).rposition(|w| w == b"ISTC");
         if let Some(istc) = istc {
@@ -475,15 +611,11 @@ fn car_deepmap2_rgba8(car: &[u8]) -> Vec<(String, u32, u32, Vec<u8>)> {
     out
 }
 
-/// #128 reproduction / ground-truth harness. Decodes the REAL deepmap2 streams Apple shipped in
-/// a .car with both `vImageDeepmap2Decode` and libdm2, comparing raw RGBA. Decoding a fixed stream
-/// is deterministic, so a correct libdm2 must match Apple byte-for-byte. Currently it does NOT for
-/// some renditions (Δ up to ~91, accumulating in predicted runs) — a libdm2 Default/type-2
-/// reconstruction bug; ruled out: YCoCg /2-vs->>1, and dropping/None-gating the negative-residual
-/// adjustment (all leave the divergence unchanged or worse).
-/// `#[ignore]`d because it depends on a host .car path and tracks the open #128 gap; run on demand:
-///   cargo test --release -- --ignored cross_real_car_payloads --nocapture
-/// When #128 is fixed this goes green and the attribute should be removed.
+/// Ground-truth harness: decodes the REAL deepmap2 streams Apple shipped in a .car with both
+/// `vImageDeepmap2Decode` and libdm2 and requires a byte-for-byte match. Decoding a fixed stream
+/// is deterministic, so a correct libdm2 must equal Apple exactly. Skips gracefully when the
+/// Accelerate symbols or the default .car are unavailable; override the catalog with
+/// COMPARE_CAR=/path/to/Assets.car.
 #[test]
 #[ignore = "reproduces libdm2 decode divergence from vImageDeepmap2Decode on some real streams"]
 fn cross_real_car_payloads() {
@@ -496,35 +628,45 @@ fn cross_real_car_payloads() {
         eprintln!("cannot read {path}; skipping");
         return;
     };
-    let samples = car_deepmap2_rgba8(&car);
-    assert!(!samples.is_empty(), "no deepmap2 RGBA8 renditions found in {path}");
-
     let mut fails = 0;
-    for (label, w, h, pay) in &samples {
-        let info = ImageInfo { width: *w, height: *h, format: PixelFormat::Rgba8 };
-        // Apple's raw decode (ground truth).
-        let Some(apple) = apple_decode(&api, pay, &info) else {
-            eprintln!("[{label}] apple decode returned NULL; skipping"); continue;
-        };
-        // Our decode.
-        let mut ours = vec![0u8; (*w as usize) * (*h as usize) * 4];
-        let mut di = ImageInfo { width: 0, height: 0, format: PixelFormat::Gray8 };
-        if let Err(e) = dm2_decode(pay, &mut ours, &mut di) {
-            eprintln!("[{label}] OUR decode failed: {e}"); fails += 1; continue;
-        }
-        let err = maxerr(&apple, &ours);
-        // locate first divergence
-        let first = apple.iter().zip(ours.iter()).position(|(a, b)| a != b);
-        if err == 0 {
-            eprintln!("[{label}] EXACT match vs vImageDeepmap2Decode");
+    let mut total = 0;
+    // RGBA8 must be present in the default corpus; RGBA16 is
+    // exercised whenever the corpus has any.
+    for fmt in [PixelFormat::Rgba8, PixelFormat::Rgba16] {
+        let samples = car_deepmap2(&car, fmt);
+        if fmt == PixelFormat::Rgba8 {
+            assert!(!samples.is_empty(), "no deepmap2 RGBA8 renditions found in {path}");
         } else {
-            fails += 1;
-            let fp = first.unwrap_or(0);
-            let px = fp / 4;
-            eprintln!("[{label}] DIVERGES maxerr={err}  first@byte {fp} (px {},{} chan {})  apple={:?} ours={:?}",
-                px % *w as usize, px / *w as usize, fp % 4,
-                &apple[fp..(fp + 4).min(apple.len())], &ours[fp..(fp + 4).min(ours.len())]);
+            eprintln!("{} RGBA16 renditions in {path}", samples.len());
+        }
+        let ps = fmt.pixel_size();
+        for (label, w, h, pay) in &samples {
+            total += 1;
+            let info = ImageInfo { width: *w, height: *h, format: fmt };
+            // Apple's raw decode (ground truth).
+            let Some(apple) = apple_decode(&api, pay, &info) else {
+                eprintln!("[{label}] apple decode returned NULL; skipping"); continue;
+            };
+            // Our decode.
+            let mut ours = vec![0u8; (*w as usize) * (*h as usize) * ps];
+            let mut di = ImageInfo { width: 0, height: 0, format: PixelFormat::Gray8 };
+            if let Err(e) = dm2_decode(pay, &mut ours, &mut di) {
+                eprintln!("[{label}] OUR decode failed: {e}"); fails += 1; continue;
+            }
+            let err = maxerr(&apple, &ours);
+            // locate first divergence
+            let first = apple.iter().zip(ours.iter()).position(|(a, b)| a != b);
+            if err == 0 {
+                eprintln!("[{label}] {fmt:?} EXACT match vs vImageDeepmap2Decode");
+            } else {
+                fails += 1;
+                let fp = first.unwrap_or(0);
+                let px = fp / ps;
+                eprintln!("[{label}] {fmt:?} DIVERGES maxerr={err}  first@byte {fp} (px {},{} byte {})  apple={:?} ours={:?}",
+                    px % *w as usize, px / *w as usize, fp % ps,
+                    &apple[fp..(fp + ps).min(apple.len())], &ours[fp..(fp + ps).min(ours.len())]);
+            }
         }
     }
-    assert_eq!(fails, 0, "{fails}/{} real deepmap2 payloads diverge from vImageDeepmap2Decode", samples.len());
+    assert_eq!(fails, 0, "{fails}/{total} real deepmap2 payloads diverge from vImageDeepmap2Decode");
 }

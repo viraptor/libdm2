@@ -1,3 +1,4 @@
+use crate::color::f32_to_f16_bits;
 use crate::encode::byte_planes_for;
 use crate::error::{Dm2Error, Result};
 use crate::format::*;
@@ -118,20 +119,27 @@ where
 
 fn decode_default(data: &[u8], hdr_len: usize, pixels: &mut [u8], info: &ImageInfo, header: &Header) -> Result<()> {
     if info.format.is_16bit() {
-        return Err(Dm2Error::BadFormat);
+        // Only RGBA16 (0x14) has been reverse-engineered against real
+        // streams. Apple requires param 9..=12 for 16-bit formats — it
+        // selects the fixed-point scale (2^(param-1)) of the stored
+        // channel codes.
+        if info.format != PixelFormat::Rgba16 || !(9..=12).contains(&header.param) {
+            return Err(Dm2Error::BadFormat);
+        }
     }
 
+    let quality = header.quality;
     let param = header.param;
     decode_tiled(&data[hdr_len..], pixels, info, header, |tile_data, out, w, h| {
-        decode_default_tile(tile_data, out, w, h, info.format, param)
+        decode_default_tile(tile_data, out, w, h, info.format, quality, param)
     })
 }
 
 // GrayA, RGB, and RGBA all use decode_default_tile_ycc (the unified
 // multi-channel decoder). Only Gray8 uses this single-channel path.
-fn decode_default_tile(tile_data: &[u8], pixels: &mut [u8], w: usize, h: usize, format: PixelFormat, param: u8) -> Result<()> {
+fn decode_default_tile(tile_data: &[u8], pixels: &mut [u8], w: usize, h: usize, format: PixelFormat, quality: u8, param: u8) -> Result<()> {
     if format.channels() >= 2 {
-        return decode_default_tile_ycc(tile_data, pixels, w, h, format, param);
+        return decode_default_tile_ycc(tile_data, pixels, w, h, format, quality, param);
     }
 
     // min_size = h * (2*w + 1); compute with checked arithmetic so hostile
@@ -188,11 +196,15 @@ fn decode_default_tile(tile_data: &[u8], pixels: &mut [u8], w: usize, h: usize, 
 /// RGB/RGBA type 2 tile decoder.
 /// Layout for alpha formats: [W*H alpha][H ycc_modes][n_color*W*H high][n_color*W*H low]
 /// Layout for non-alpha:     [H ycc_modes][n_color*W*H high][n_color*W*H low]
-fn decode_default_tile_ycc(tile_data: &[u8], pixels: &mut [u8], w: usize, h: usize, format: PixelFormat, param: u8) -> Result<()> {
-    // Apple stores Co/Cg at HALF scale when the header `param` is non-zero (observed: real .car
-    // renditions use param=10 for 8-bit and need the chroma doubled on the inverse transform; the
-    // param=0 path stores full-scale chroma). Inferred from cross-validation vs vImageDeepmap2Decode.
-    let chroma_scale: i16 = if param != 0 { 2 } else { 1 };
+fn decode_default_tile_ycc(tile_data: &[u8], pixels: &mut [u8], w: usize, h: usize, format: PixelFormat, quality: u8, param: u8) -> Result<()> {
+    // Apple stores Co/Cg at HALF scale when the header `quality` is non-zero, full scale when it
+    // is 0 — this halving IS the documented quality=1 "maxerr=1 on R/G" loss. It is keyed on the
+    // quality byte, NOT param: vImage cross-validation shows param has no effect on 8-bit streams
+    // (q1/p0 and q1/p10 encode byte-identically; q0/p10 streams are full-scale), and the same rule
+    // holds for RGBA16. An earlier param-based rule here only worked because every real .car
+    // rendition ships with (quality=1, param=10). For 16-bit formats param instead selects the
+    // fixed-point scale of the channel codes (see the Rgba16 output arm below).
+    let chroma_scale: i16 = if quality != 0 { 2 } else { 1 };
     let channels = format.channels();
     let has_alpha = channels == 2 || channels == 4;
     let k = byte_planes_for(format);
@@ -249,19 +261,24 @@ fn decode_default_tile_ycc(tile_data: &[u8], pixels: &mut [u8], w: usize, h: usi
             if res_co < 0 { res_co += 1; }
             if res_cg < 0 { res_cg += 1; }
 
+            // All accumulation WRAPS at i16, matching Apple's 16-bit-lane
+            // arithmetic. Real 16-bit streams do exceed i16 (the encoder
+            // itself wraps out-of-range fixed-point codes), so wrapping is
+            // load-bearing semantics — not just overflow hygiene — verified
+            // against vImageDeepmap2Decode on codes crossing ±32768.
             match mode {
                 PredictMode::None => {
                     cur_y[i] = res_y; cur_co[i] = res_co; cur_cg[i] = res_cg;
                 }
                 PredictMode::Left => {
-                    cur_y[i] = res_y + if i == 0 { 0 } else { cur_y[i - 1] };
-                    cur_co[i] = res_co + if i == 0 { 0 } else { cur_co[i - 1] };
-                    cur_cg[i] = res_cg + if i == 0 { 0 } else { cur_cg[i - 1] };
+                    cur_y[i] = res_y.wrapping_add(if i == 0 { 0 } else { cur_y[i - 1] });
+                    cur_co[i] = res_co.wrapping_add(if i == 0 { 0 } else { cur_co[i - 1] });
+                    cur_cg[i] = res_cg.wrapping_add(if i == 0 { 0 } else { cur_cg[i - 1] });
                 }
                 PredictMode::Up => {
-                    cur_y[i] = res_y + prev_y[i];
-                    cur_co[i] = res_co + prev_co[i];
-                    cur_cg[i] = res_cg + prev_cg[i];
+                    cur_y[i] = res_y.wrapping_add(prev_y[i]);
+                    cur_co[i] = res_co.wrapping_add(prev_co[i]);
+                    cur_cg[i] = res_cg.wrapping_add(prev_cg[i]);
                 }
                 PredictMode::UpLeft => {
                     // 2-way Paeth: the selection is computed once on the Y
@@ -278,22 +295,31 @@ fn decode_default_tile_ycc(tile_data: &[u8], pixels: &mut [u8], w: usize, h: usi
                             (cur_y[i-1], cur_co[i-1], cur_cg[i-1])
                         }
                     };
-                    cur_y[i] = res_y + py;
-                    cur_co[i] = res_co + pco;
-                    cur_cg[i] = res_cg + pcg;
+                    cur_y[i] = res_y.wrapping_add(py);
+                    cur_co[i] = res_co.wrapping_add(pco);
+                    cur_cg[i] = res_cg.wrapping_add(pcg);
                 }
                 PredictMode::Mean => {
                     if i == 0 {
-                        cur_y[i] = res_y + prev_y[i];
-                        cur_co[i] = res_co + prev_co[i];
-                        cur_cg[i] = res_cg + prev_cg[i];
+                        cur_y[i] = res_y.wrapping_add(prev_y[i]);
+                        cur_co[i] = res_co.wrapping_add(prev_co[i]);
+                        cur_cg[i] = res_cg.wrapping_add(prev_cg[i]);
                     } else {
-                        let mut sy = cur_y[i-1] as i32 + prev_y[i] as i32 + 1; if sy < 0 { sy += 1; }
-                        let mut sco = cur_co[i-1] as i32 + prev_co[i] as i32 + 1; if sco < 0 { sco += 1; }
-                        let mut scg = cur_cg[i-1] as i32 + prev_cg[i] as i32 + 1; if scg < 0 { scg += 1; }
-                        cur_y[i] = res_y + (sy >> 1) as i16;
-                        cur_co[i] = res_co + (sco >> 1) as i16;
-                        cur_cg[i] = res_cg + (scg >> 1) as i16;
+                        // The (left + up + 1) sum WRAPS at i16 before the
+                        // truncation fix and shift — differentially pinned
+                        // against vImageDeepmap2Decode on 16-bit streams
+                        // whose sums cross ±32768 (an i32 sum here decoded
+                        // those streams measurably differently; for 8-bit
+                        // streams the sum can never leave i16, so this is
+                        // behavior-neutral there).
+                        let mean16 = |left: i16, up: i16| -> i16 {
+                            let mut s = left.wrapping_add(up).wrapping_add(1);
+                            if s < 0 { s += 1; }
+                            s >> 1
+                        };
+                        cur_y[i] = res_y.wrapping_add(mean16(cur_y[i-1], prev_y[i]));
+                        cur_co[i] = res_co.wrapping_add(mean16(cur_co[i-1], prev_co[i]));
+                        cur_cg[i] = res_cg.wrapping_add(mean16(cur_cg[i-1], prev_cg[i]));
                     }
                 }
             }
@@ -307,12 +333,12 @@ fn decode_default_tile_ycc(tile_data: &[u8], pixels: &mut [u8], w: usize, h: usi
         match format {
             PixelFormat::Rgba8 => {
                 for i in 0..w {
-                    let co = cur_co[i] * chroma_scale;
-                    let cg = cur_cg[i] * chroma_scale;
-                    let t = cur_y[i] - cg / 2;
-                    let g = cg + t;
-                    let b = t - co / 2;
-                    let r = co + b;
+                    let co = cur_co[i].wrapping_mul(chroma_scale);
+                    let cg = cur_cg[i].wrapping_mul(chroma_scale);
+                    let t = cur_y[i].wrapping_sub(cg / 2);
+                    let g = cg.wrapping_add(t);
+                    let b = t.wrapping_sub(co / 2);
+                    let r = co.wrapping_add(b);
                     row_pixels[i * 4] = r.clamp(0, 255) as u8;
                     row_pixels[i * 4 + 1] = g.clamp(0, 255) as u8;
                     row_pixels[i * 4 + 2] = b.clamp(0, 255) as u8;
@@ -321,12 +347,12 @@ fn decode_default_tile_ycc(tile_data: &[u8], pixels: &mut [u8], w: usize, h: usi
             }
             PixelFormat::Rgb8 => {
                 for i in 0..w {
-                    let co = cur_co[i] * chroma_scale;
-                    let cg = cur_cg[i] * chroma_scale;
-                    let t = cur_y[i] - cg / 2;
-                    let g = cg + t;
-                    let b = t - co / 2;
-                    let r = co + b;
+                    let co = cur_co[i].wrapping_mul(chroma_scale);
+                    let cg = cur_cg[i].wrapping_mul(chroma_scale);
+                    let t = cur_y[i].wrapping_sub(cg / 2);
+                    let g = cg.wrapping_add(t);
+                    let b = t.wrapping_sub(co / 2);
+                    let r = co.wrapping_add(b);
                     row_pixels[i * 3] = r.clamp(0, 255) as u8;
                     row_pixels[i * 3 + 1] = g.clamp(0, 255) as u8;
                     row_pixels[i * 3 + 2] = b.clamp(0, 255) as u8;
@@ -338,9 +364,42 @@ fn decode_default_tile_ycc(tile_data: &[u8], pixels: &mut [u8], w: usize, h: usi
                     row_pixels[i * 2 + 1] = buf[row * w + i];
                 }
             }
-            // 1-channel and 16-bit formats are routed away before reaching
-            // here; reject explicitly rather than panic if a future caller
-            // breaks the dispatch invariant.
+            PixelFormat::Rgba16 => {
+                // 16-bit type 2 uses the SAME intermediate layout as RGBA8
+                // (1-byte alpha plane + 16-bit YCoCg zigzag residuals in
+                // high/low byte planes, K=7); only the output stage differs.
+                // The reconstructed integers are fixed-point codes of
+                // half-float channel values: value = code / 2^(param-1)
+                // (param 9..=12; real .car renditions use 10 -> /512), and
+                // the 8-bit alpha plane expands to half(a/255). The output
+                // pixels are IEEE half bit patterns, little-endian — byte-
+                // identical to vImageDeepmap2Decode (verified on
+                // Apple-encoded fixtures).
+                let scale = (1u32 << (param - 1)) as f32;
+                for i in 0..w {
+                    // Inverse YCoCg with WRAPPING i16 arithmetic — like the
+                    // prediction stage, this must wrap exactly where Apple's
+                    // 16-bit lanes do (verified: codes pushed past ±32768 by
+                    // the encoder come out sign-flipped from Apple's decoder
+                    // too). `/ 2` truncates toward zero, matching Apple.
+                    let co = cur_co[i].wrapping_mul(chroma_scale);
+                    let cg = cur_cg[i].wrapping_mul(chroma_scale);
+                    let t = cur_y[i].wrapping_sub(cg / 2);
+                    let g = cg.wrapping_add(t);
+                    let b = t.wrapping_sub(co / 2);
+                    let r = co.wrapping_add(b);
+                    let a = buf[row * w + i];
+                    let px = &mut row_pixels[i * 8..i * 8 + 8];
+                    px[0..2].copy_from_slice(&f32_to_f16_bits(r as f32 / scale).to_le_bytes());
+                    px[2..4].copy_from_slice(&f32_to_f16_bits(g as f32 / scale).to_le_bytes());
+                    px[4..6].copy_from_slice(&f32_to_f16_bits(b as f32 / scale).to_le_bytes());
+                    px[6..8].copy_from_slice(&f32_to_f16_bits(a as f32 / 255.0).to_le_bytes());
+                }
+            }
+            // 1-channel and the un-reverse-engineered 16-bit formats
+            // (Gray16/GrayA16/Rgb16) are routed away before reaching here;
+            // reject explicitly rather than panic if a future caller breaks
+            // the dispatch invariant.
             _ => return Err(Dm2Error::BadFormat),
         }
 

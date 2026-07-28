@@ -97,8 +97,11 @@ fn encode_lossless(pixels: &[u8], info: &ImageInfo) -> Result<Vec<u8>> {
 /// falls back to lossless (type 3).
 #[derive(Debug, Clone, Copy)]
 enum DefaultUnsupported {
-    /// Type 2 has no defined encoding for 16-bit pixel formats — Apple's
-    /// own type-2 round-trip is broken for them (see deepmap2.md).
+    /// The 16-bit type-2 ENCODER is not implemented. Apple's encoder
+    /// quantizes half-float channels to fixed-point codes (lossy — see
+    /// deepmap2.md "16-bit formats"); we decode that scheme (RGBA16) but
+    /// have not reverse-engineered the encoder's quantization/quality
+    /// behaviour, so encoding is refused rather than approximated.
     SixteenBit,
     /// The intermediate buffer is too small for LZFSE to amortize its
     /// per-block overhead, or the image is too narrow/short for the
@@ -130,9 +133,10 @@ fn default_limitation(_pixels: &[u8], info: &ImageInfo) -> Option<DefaultUnsuppo
 /// format including all five prediction modes.
 fn encode_default(pixels: &[u8], info: &ImageInfo) -> Result<Vec<u8>> {
     match default_limitation(pixels, info) {
-        // 16-bit is a hard rejection: Apple's own type-2 round-trip is
-        // broken for these formats, so we refuse rather than silently
-        // pick a different scheme.
+        // 16-bit is a hard rejection: Apple's 16-bit type-2 encode is
+        // inherently lossy (fixed-point quantization) and we haven't
+        // reverse-engineered it, so we refuse rather than silently pick
+        // a different scheme. (Decode of RGBA16 type 2 IS supported.)
         Some(DefaultUnsupported::SixteenBit) => return Err(Dm2Error::BadFormat),
         // Every other limitation is a transparent fallback to lossless.
         Some(_) => return encode_lossless(pixels, info),

@@ -75,7 +75,8 @@ typedef struct {
 
 - **quality**: Only values 0 and 1 are accepted for compression types 2 and 3 (≥2 returns failure).
   For type 1 (none), all values 0–255 are stored but have no effect. quality=0 is always lossless.
-  quality=1 with type 2 introduces maxerr=1 on R/G channels for RGBA only.
+  quality=1 with type 2 introduces maxerr=1 on R/G channels for RGB and RGBA
+  (half-scale chroma storage; gray and gray+A have no chroma and stay lossless).
 - **param**: Has no effect on 8-bit format encoded output (all values produce identical data).
   For 16-bit formats (0x11–0x14), `param` must be in range 9–12 (0x09–0x0c); all other values rejected.
 - `EncodeCreateBuffer` overrides `compressionType` — it tries 3, then 4 (if fmt=4), then 2, and picks the smallest.
@@ -351,17 +352,66 @@ and decoder track the **reconstructed values** from the previous row as the refe
 
 ### Quality and param
 
-- quality=0: Lossless for all 8-bit formats.
-- quality=1: Lossless for gray, gray+A, and RGB. For RGBA, introduces maxerr=1 on R/G channels.
+- quality=0: Lossless for all 8-bit formats. Co/Cg are stored at FULL scale.
+- quality=1: Lossless for gray and gray+A (no chroma planes). For RGB and RGBA,
+  Co/Cg are stored at HALF scale and the decoder doubles them — this halving is
+  exactly the maxerr=1 on R/G channels (measured on both RGB and RGBA; an
+  earlier note claiming RGB stayed lossless at quality=1 was wrong).
 - quality ≥ 2: Encoder returns failure.
-- param: Stored in header, no effect on 8-bit output.
+- param: Stored in header, no effect on 8-bit output (verified: q1/p0 and q1/p10
+  encode byte-identically; the chroma-scale switch is the QUALITY byte, not param).
+  For 16-bit formats param selects the fixed-point scale (see below).
 
-### 16-bit formats
+### 16-bit formats (RGBA16 reverse-engineered)
 
-**Apple bug**: Apple's own type 2 encoder/decoder produces catastrophically wrong output
-for 16-bit pixel formats (0x11–0x14). Apple encodes successfully but its own decoder
-returns maxerr=65535 (fully corrupted). Type 1 (None) also fails to encode 16-bit data.
-Only type 3 (Lossless) works correctly for 16-bit formats.
+16-bit pixels are u16 per channel; in real `.car` renditions (csiheader
+pixelFormat `'RGBW'`) the u16s are **IEEE half-float bit patterns**
+(little-endian), which is why values like 0x3C00 (1.0h) and sign-bit
+patterns ≥ 0x8000 (negative extended-range colors) appear.
+
+**Type 2 for RGBA16 (0x14)** uses the SAME intermediate tile layout as RGBA8 —
+K=7 byte-planes: `[W×H alpha][H mode bytes][3×W×H high][3×W×H low]` — with the
+same prediction modes, zigzag, negative-residual adjustment, and half-scale
+chroma (quality ≠ 0). Only the pixel⇄integer mapping differs:
+
+- **Color channels**: the reconstructed YCoCg→RGB integers are *fixed-point codes*
+  of the half-float channel values: `value = code / 2^(param-1)`. `param` must be
+  9–12 (real renditions use 10 → scale 512). The decoder emits
+  `f16(code / 2^(param-1))` per channel, rounding to nearest-even.
+- **Alpha**: stored as a plain 8-bit plane (like RGBA8); the decoder expands it to
+  `f16(a8 / 255)`.
+
+**Wrapping arithmetic**: the decoder's prediction accumulation and inverse
+YCoCg transform operate in 16-bit lanes that WRAP (two's complement). The Mean
+predictor computes `left + up + 1` wrapped at i16 first, then applies the
+negative truncation fix and the shift. Garbage half inputs (NaN/Inf/2^13-scale)
+make Apple's ENCODER wrap the fixed-point codes at i16, which exposes these
+semantics; matching them fixes the observable sign-flip pixels. One corner is
+intentionally left unchased: quality=0 param=10..12 streams built from such
+garbage inputs still diverge on a handful of wrapped pixels (Apple's own
+encode of those inputs is already total value corruption, and every observed
+real rendition is quality=1 param=10 with |v| ≲ 1).
+
+Verified byte-identical to `vImageDeepmap2Decode` on Apple-encoded fixtures at
+every param 9–12 and quality 0/1 (`tests/data/rgba16_*`), and on random
+valid-half images (|v| < 4) across the full param × quality grid.
+
+Encoding is inherently **lossy** (float → fixed-point quantization; quality=0 still
+shows ±half-ulp rounding, quality=1 substantially more). An earlier note here
+claimed Apple's 16-bit type-2 round-trip was "catastrophically broken" — that
+misread the quantization loss measured on raw bit patterns (a small float error
+across a half-float exponent boundary produces a huge bit-pattern delta). Apple's
+decoder is deterministic and correct for these streams.
+
+The tiling budget also differs for 16-bit type 2: 1024-wide RGBA16 uses
+tileHeight 291 ≈ 1,044,480 / (W × K/2) — i.e. the budget appears to be computed
+on intermediate-buffer bytes, not the 8-byte raw pixels. Decoders need not care
+(tileHeight is in the header); only an encoder implementation would.
+
+Gray16 (0x11), GrayA16 (0x12), and RGB16 (0x13) type 2 remain un-reverse-engineered
+(no known real-world samples); libdm2 rejects them. Type 1 (None) fails to encode
+16-bit data in Apple's implementation; type 3 (Lossless) is format-agnostic and
+works for all 16-bit formats.
 
 ## Compression Type 4 (Palette)
 

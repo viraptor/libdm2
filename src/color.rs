@@ -91,6 +91,51 @@ pub fn ycocg_to_rgb(y: &[i16], co: &[i16], cg: &[i16], w: usize, pixels: &mut [u
 }
 
 
+/// Convert an `f32` to IEEE 754 binary16 (half-float) bits, rounding to
+/// nearest-even — the same conversion the hardware `fcvt` performs.
+///
+/// Used by the 16-bit type-2 decode path: RGBA16 deepmap2 streams store
+/// channel values as fixed-point integer codes that expand to half-float
+/// bit patterns (`value = code / 2^(param-1)`, alpha = `a8 / 255`), and
+/// Apple's decoder emits the round-to-nearest-even half of that quotient.
+pub fn f32_to_f16_bits(x: f32) -> u16 {
+    let bits = x.to_bits();
+    let sign = ((bits >> 16) & 0x8000) as u16;
+    let exp = ((bits >> 23) & 0xff) as i32;
+    let mant = bits & 0x007f_ffff;
+    if exp == 0xff {
+        // Inf stays Inf; NaN keeps a quiet-bit payload so it stays NaN.
+        return sign | 0x7c00 | if mant != 0 { 0x0200 } else { 0 };
+    }
+    let unbiased = exp - 127;
+    if unbiased >= 16 {
+        return sign | 0x7c00; // overflows half range -> ±Inf
+    }
+    if unbiased >= -14 {
+        // Normal half. Rounding may carry from mantissa into exponent —
+        // adding 1 to the packed value handles that correctly (IEEE trick).
+        let mut h = (sign as u32) | ((((unbiased + 15) as u32) << 10) | (mant >> 13));
+        let rest = mant & 0x1fff;
+        if rest > 0x1000 || (rest == 0x1000 && (h & 1) != 0) {
+            h += 1;
+        }
+        return h as u16;
+    }
+    // Subnormal half (or underflow to zero).
+    if unbiased < -25 {
+        return sign; // below half of the smallest subnormal -> ±0
+    }
+    let mant = mant | 0x0080_0000; // make the implicit leading 1 explicit
+    let shift = (13 + (-14 - unbiased)) as u32; // 14..=24
+    let mut h = (sign as u32) | (mant >> shift);
+    let rest = mant & ((1u32 << shift) - 1);
+    let halfway = 1u32 << (shift - 1);
+    if rest > halfway || (rest == halfway && (h & 1) != 0) {
+        h += 1;
+    }
+    h as u16
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -107,6 +152,41 @@ mod tests {
         let mut out = vec![0u8; 12];
         ycocg_to_rgba(&y, &co, &cg, &a, w, &mut out);
         assert_eq!(&out, &pixels);
+    }
+
+    /// Expected bit patterns cross-checked against Apple's decoder output on
+    /// real .car RGBA16 renditions — see decode16 tests.
+    #[test]
+    fn f16_conversion_oracle_values() {
+        // Alpha expansion a8/255 observed in vImageDeepmap2Decode output.
+        assert_eq!(f32_to_f16_bits(23.0 / 255.0), 0x2dc6);
+        assert_eq!(f32_to_f16_bits(129.0 / 255.0), 0x380c);
+        assert_eq!(f32_to_f16_bits(55.0 / 255.0), 0x32e7);
+        assert_eq!(f32_to_f16_bits(255.0 / 255.0), 0x3c00); // 1.0
+        // Fixed-point colour codes / 512 (param=10) observed likewise.
+        assert_eq!(f32_to_f16_bits(2.0 / 512.0), 0x1c00);
+        assert_eq!(f32_to_f16_bits(98.0 / 512.0), 0x3220);
+        assert_eq!(f32_to_f16_bits(-10.0 / 512.0), 0xa500);
+        assert_eq!(f32_to_f16_bits(-5.0 / 512.0), 0xa100);
+        // Specials and boundaries.
+        assert_eq!(f32_to_f16_bits(0.0), 0x0000);
+        assert_eq!(f32_to_f16_bits(-0.0), 0x8000);
+        assert_eq!(f32_to_f16_bits(65504.0), 0x7bff); // half max
+        assert_eq!(f32_to_f16_bits(65520.0), 0x7c00); // rounds up to +Inf
+        assert_eq!(f32_to_f16_bits(65519.0), 0x7bff); // rounds down to max
+        assert_eq!(f32_to_f16_bits(f32::INFINITY), 0x7c00);
+        assert_eq!(f32_to_f16_bits(f32::NEG_INFINITY), 0xfc00);
+        assert_eq!(f32_to_f16_bits(f32::NAN) & 0x7c00, 0x7c00);
+        assert_ne!(f32_to_f16_bits(f32::NAN) & 0x03ff, 0);
+        // Subnormal range: 2^-24 is the smallest half subnormal.
+        assert_eq!(f32_to_f16_bits(5.9604645e-8), 0x0001); // 2^-24
+        assert_eq!(f32_to_f16_bits(2.9802322e-8), 0x0000); // 2^-25 ties to even 0
+        assert_eq!(f32_to_f16_bits(4.4703484e-8), 0x0001); // 1.5*2^-25 rounds up
+        // Round-to-nearest-even on a normal boundary: 2049/2048 is exactly
+        // between 1.0 and the next half (1+2^-10) -> ties to even (1.0).
+        assert_eq!(f32_to_f16_bits(2049.0 / 2048.0), 0x3c00);
+        assert_eq!(f32_to_f16_bits(2050.0 / 2048.0), 0x3c01); // exactly 1+2^-10
+        assert_eq!(f32_to_f16_bits(2051.0 / 2048.0), 0x3c02); // tie -> even (up)
     }
 
     #[test]

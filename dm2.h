@@ -47,7 +47,13 @@ int dm2_encode(const uint8_t *pixels, size_t pixels_len,
                const dm2_image_info_t *info, uint32_t compression,
                uint8_t **out, size_t *out_len);
 
-/* Decode deepmap2 data into pixel buffer. info is filled on success. */
+/* Decode deepmap2 data into pixel buffer. info is filled on success.
+ * Output is the stream's NATIVE depth, matching vImageDeepmap2Decode:
+ * 8-bit formats give 1 byte per channel; 16-bit formats give a little-
+ * endian uint16 per channel (DM2_RGBA16 .car renditions carry IEEE
+ * half-float bit patterns — CoreUI-style 8-bit output is the caller's
+ * downconversion, ~ clamp(half,0,1)*255). Size the buffer with
+ * dm2_pixel_size(): pixels_len = width * height * pixel_size. */
 int dm2_decode(const uint8_t *data, size_t data_len,
                uint8_t *pixels, size_t pixels_len,
                dm2_image_info_t *info);
