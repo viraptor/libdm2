@@ -1,8 +1,45 @@
 use crate::error::Dm2Error;
 use crate::format::{Compression, ImageInfo, PixelFormat};
 use std::ffi::CStr;
+use std::panic::{self, AssertUnwindSafe};
 use std::path::Path;
 use std::slice;
+use std::sync::Once;
+
+static HOOK: Once = Once::new();
+
+/// Install a lightweight panic hook exactly once. The DEFAULT Rust hook captures
+/// and symbolizes a backtrace (gimli/addr2line DWARF line-table parsing across every
+/// loaded image). So we print just the message+location (no
+/// backtrace) and rely on the `guard()` catch_unwind below to turn the panic into a
+/// clean error code. This keeps a malformed/unsupported swatch from hanging the host.
+fn install_hook() {
+    HOOK.call_once(|| {
+        panic::set_hook(Box::new(|pi| {
+            let loc = pi
+                .location()
+                .map(|l| format!("{}:{}", l.file(), l.line()))
+                .unwrap_or_else(|| "<unknown>".into());
+            let msg = pi
+                .payload()
+                .downcast_ref::<&str>()
+                .copied()
+                .or_else(|| pi.payload().downcast_ref::<String>().map(|s| s.as_str()))
+                .unwrap_or("<non-string panic payload>");
+            eprintln!("[libdm2] panic at {loc}: {msg}");
+        }));
+    });
+}
+
+/// Run an FFI body, converting any panic into `Dm2Error::DecodeFailed` instead of
+/// unwinding across the C boundary. Instant (no backtrace) thanks to `install_hook`.
+fn guard<F: FnOnce() -> i32>(f: F) -> i32 {
+    install_hook();
+    match panic::catch_unwind(AssertUnwindSafe(f)) {
+        Ok(code) => code,
+        Err(_) => Dm2Error::DecodeFailed as i32,
+    }
+}
 
 #[repr(C)]
 pub struct Dm2ImageInfo {
@@ -99,11 +136,15 @@ pub unsafe extern "C" fn dm2_decode(
     }
     let data = slice::from_raw_parts(data, data_len);
     let pixels = slice::from_raw_parts_mut(pixels, pixels_len);
-    let mut info_r = ImageInfo { width: 0, height: 0, format: PixelFormat::Gray8 };
 
-    let r = crate::dm2_decode(data, pixels, &mut info_r);
-    *info = Dm2ImageInfo::from(&info_r);
-    result_to_code(r)
+    guard(move || {
+        let mut info_r = ImageInfo { width: 0, height: 0, format: PixelFormat::Gray8 };
+        let r = crate::dm2_decode(data, pixels, &mut info_r);
+        // SAFETY: `info` non-null checked above; write occurs inside the guard so a
+        // panic in dm2_decode still lands here as DecodeFailed rather than unwinding.
+        unsafe { *info = Dm2ImageInfo::from(&info_r); }
+        result_to_code(r)
+    })
 }
 
 /// Read image info without decoding.
@@ -116,13 +157,14 @@ pub unsafe extern "C" fn dm2_read_info(
         return Dm2Error::InvalidArg as i32;
     }
     let data = slice::from_raw_parts(data, data_len);
-    match crate::dm2_read_info(data) {
+    guard(move || match crate::dm2_read_info(data) {
         Ok((info_r, _)) => {
-            *info = Dm2ImageInfo::from(&info_r);
+            // SAFETY: `info` non-null checked above; guarded against panic.
+            unsafe { *info = Dm2ImageInfo::from(&info_r); }
             0
         }
         Err(e) => e as i32,
-    }
+    })
 }
 
 /// Returns bytes per pixel for a format, or 0 if invalid.
