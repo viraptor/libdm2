@@ -121,16 +121,17 @@ fn decode_default(data: &[u8], hdr_len: usize, pixels: &mut [u8], info: &ImageIn
         return Err(Dm2Error::BadFormat);
     }
 
+    let param = header.param;
     decode_tiled(&data[hdr_len..], pixels, info, header, |tile_data, out, w, h| {
-        decode_default_tile(tile_data, out, w, h, info.format)
+        decode_default_tile(tile_data, out, w, h, info.format, param)
     })
 }
 
 // GrayA, RGB, and RGBA all use decode_default_tile_ycc (the unified
 // multi-channel decoder). Only Gray8 uses this single-channel path.
-fn decode_default_tile(tile_data: &[u8], pixels: &mut [u8], w: usize, h: usize, format: PixelFormat) -> Result<()> {
+fn decode_default_tile(tile_data: &[u8], pixels: &mut [u8], w: usize, h: usize, format: PixelFormat, param: u8) -> Result<()> {
     if format.channels() >= 2 {
-        return decode_default_tile_ycc(tile_data, pixels, w, h, format);
+        return decode_default_tile_ycc(tile_data, pixels, w, h, format, param);
     }
 
     // min_size = h * (2*w + 1); compute with checked arithmetic so hostile
@@ -187,7 +188,11 @@ fn decode_default_tile(tile_data: &[u8], pixels: &mut [u8], w: usize, h: usize, 
 /// RGB/RGBA type 2 tile decoder.
 /// Layout for alpha formats: [W*H alpha][H ycc_modes][n_color*W*H high][n_color*W*H low]
 /// Layout for non-alpha:     [H ycc_modes][n_color*W*H high][n_color*W*H low]
-fn decode_default_tile_ycc(tile_data: &[u8], pixels: &mut [u8], w: usize, h: usize, format: PixelFormat) -> Result<()> {
+fn decode_default_tile_ycc(tile_data: &[u8], pixels: &mut [u8], w: usize, h: usize, format: PixelFormat, param: u8) -> Result<()> {
+    // Apple stores Co/Cg at HALF scale when the header `param` is non-zero (observed: real .car
+    // renditions use param=10 for 8-bit and need the chroma doubled on the inverse transform; the
+    // param=0 path stores full-scale chroma). Inferred from cross-validation vs vImageDeepmap2Decode.
+    let chroma_scale: i16 = if param != 0 { 2 } else { 1 };
     let channels = format.channels();
     let has_alpha = channels == 2 || channels == 4;
     let k = byte_planes_for(format);
@@ -302,8 +307,8 @@ fn decode_default_tile_ycc(tile_data: &[u8], pixels: &mut [u8], w: usize, h: usi
         match format {
             PixelFormat::Rgba8 => {
                 for i in 0..w {
-                    let co = cur_co[i];
-                    let cg = cur_cg[i];
+                    let co = cur_co[i] * chroma_scale;
+                    let cg = cur_cg[i] * chroma_scale;
                     let t = cur_y[i] - cg / 2;
                     let g = cg + t;
                     let b = t - co / 2;
@@ -316,8 +321,8 @@ fn decode_default_tile_ycc(tile_data: &[u8], pixels: &mut [u8], w: usize, h: usi
             }
             PixelFormat::Rgb8 => {
                 for i in 0..w {
-                    let co = cur_co[i];
-                    let cg = cur_cg[i];
+                    let co = cur_co[i] * chroma_scale;
+                    let cg = cur_cg[i] * chroma_scale;
                     let t = cur_y[i] - cg / 2;
                     let g = cg + t;
                     let b = t - co / 2;
