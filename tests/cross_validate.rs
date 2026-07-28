@@ -783,3 +783,84 @@ fn cross_real_car_payloads() {
     }
     assert_eq!(fails, 0, "{fails}/{total} real deepmap2 payloads diverge from vImageDeepmap2Decode");
 }
+
+/// With the type-2 encoder byte-exact and the LZFSE port byte-identical to
+/// Apple's, full Default-compression streams should match Apple's output
+/// byte-for-byte whenever tiles reach the LZFSE path (>= 4096 raw bytes).
+/// Tiles below that use raw LZVN, where our match finder legitimately
+/// differs, so this test sticks to large images.
+#[test]
+fn cross_default_encoder_full_stream_byte_identity() {
+    let Some(api) = apple_api() else { return };
+    use PixelFormat::*;
+    for &(fmt, param) in &[(Gray8, 0u32), (Rgba8, 0), (Rgb16, 12)] {
+        let (w, h) = (256u32, 1200u32);
+        let inputs: Vec<(&str, Vec<u8>)> = if fmt.is_16bit() {
+            vec![("halfs", sane_halfs_16(w, h, fmt, 0x51de))]
+        } else {
+            vec![
+                ("gradient", gradient(w, h, fmt)),
+                ("random", random(w, h, fmt, 0xacc01ade)),
+            ]
+        };
+        for (name, pixels) in inputs {
+            let info = ImageInfo { width: w, height: h, format: fmt };
+            for quality in 0..=1u32 {
+                let label = format!("stream-id/{fmt:?}/{name}/q{quality}");
+                let Some(apple) =
+                    apple_encode_opts(&api, &pixels, &info, Compression::Default, quality, param)
+                else {
+                    continue;
+                };
+                let ours =
+                    dm2_encode_opts(&pixels, &info, Compression::Default, quality as u8, param as u8)
+                        .unwrap_or_else(|e| panic!("[{label}] our encode failed: {e}"));
+                assert_eq!(ours.len(), apple.len(), "[{label}] stream length differs");
+                assert_eq!(ours, apple, "[{label}] stream bytes differ");
+            }
+        }
+    }
+}
+
+/// Broader coverage of the same contract across formats, sizes (single- and
+/// multi-tile) and content types.
+#[test]
+fn cross_default_encoder_full_stream_byte_identity_wide() {
+    let Some(api) = apple_api() else { return };
+    use PixelFormat::*;
+    let cases: &[(PixelFormat, u32)] = &[
+        (GrayA8, 0), (Rgb8, 0), (Gray16, 9), (GrayA16, 11), (Rgba16, 10),
+    ];
+    for &(fmt, param) in cases {
+        for &(w, h) in &[(256u32, 900u32), (256, 2200), (97, 555)] {
+            let inputs: Vec<(&str, Vec<u8>)> = if fmt.is_16bit() {
+                vec![
+                    ("halfs", sane_halfs_16(w, h, fmt, (w as u64) << 24 | h as u64)),
+                    ("garbage", random(w, h, fmt, 0xefface ^ ((w as u64) << 4) ^ h as u64)),
+                ]
+            } else {
+                vec![
+                    ("gradient", gradient(w, h, fmt)),
+                    ("checker", checker(w, h, fmt)),
+                    ("random", random(w, h, fmt, 0xacc01ade ^ ((w as u64) << 8) ^ h as u64)),
+                ]
+            };
+            for (name, pixels) in inputs {
+                let info = ImageInfo { width: w, height: h, format: fmt };
+                for quality in 0..=1u32 {
+                    let label = format!("stream-idw/{fmt:?}/{name}_{w}x{h}/q{quality}");
+                    let Some(apple) =
+                        apple_encode_opts(&api, &pixels, &info, Compression::Default, quality, param)
+                    else {
+                        continue;
+                    };
+                    let ours = dm2_encode_opts(
+                        &pixels, &info, Compression::Default, quality as u8, param as u8,
+                    )
+                    .unwrap_or_else(|e| panic!("[{label}] our encode failed: {e}"));
+                    assert_eq!(ours, apple, "[{label}] stream bytes differ");
+                }
+            }
+        }
+    }
+}

@@ -167,6 +167,27 @@ The deepmap2 decoder rejects `bvxn` (LZVN-in-container) blocks even though
 the standard LZFSE format permits them.
 The LZVN end-of-stream marker must be 8 bytes: `0x06` followed by 7 zero bytes.
 
+#### Apple's LZFSE encoder differs from the open-source release
+
+vImage reaches LZFSE through `libcompression.dylib`, whose encoder is a
+newer variant of the published `lzfse` sources. Two differences change
+where block boundaries land, and therefore the compressed bytes:
+
+| Behavior | Open-source lzfse | libcompression (`lzfseEncodeBase`, `lzfsePushMatch`) |
+|---|---|---|
+| Literal-lag flush threshold | `n_literals > 8 × MAX_L` (2520) | `n_literals > 3 × MAX_L` (946) — `cmp x12, #0x3b2` |
+| Literal capacity check when splitting a match | `n_literals + L + 16` re-read from state per part | running accumulator: `w9` is loaded once and each part adds `L + 16` to it, so it drifts 16 bytes high per extra part |
+
+Everything else — the hash function, match search, filtering heuristic,
+FSE tables, header packing — matches the published code. libdm2
+implements the libcompression behavior, which is what produces
+byte-identical streams against `vImageDeepmap2Encode`.
+
+The flush threshold is the one that matters in practice: reverting it
+alone breaks stream identity on ordinary images. The capacity-accumulator
+drift needs a match whose literal run splits into several parts *and* lands
+within 16 bytes of the per-block literal cap.
+
 ### Tile layout
 
 After the 12-byte header, tiles are stored sequentially:
@@ -484,10 +505,13 @@ Apple's type-2 encoder rejects images with fewer than 4 pixels.
 
 libdm2's type-2 encoder replicates this pipeline exactly: for identical
 input it produces byte-identical intermediate buffers (and therefore
-byte-identical decoded output through any correct decoder). The whole
-STREAM is still not byte-identical because the LZFSE/LZVN entropy stage
-uses a different match finder than Apple's; only the compressed bytes
-differ, not what they decompress to. Caveat: exact mode-byte fidelity
+byte-identical decoded output through any correct decoder). Combined with
+the LZFSE port (see "Apple's LZFSE encoder differs from the open-source
+release"), whole streams are byte-identical to `vImageDeepmap2Encode`
+whenever tiles reach the LZFSE path (≥ 4096 raw bytes); below that
+threshold tiles use raw LZVN, where our match finder still differs, so
+only the compressed bytes differ, not what they decompress to.
+Caveat: exact mode-byte fidelity
 depends on bit-exact `logf` and f32 accumulation order; libdm2 matches
 on macOS (Rust's `f32::ln` calls the same libsystem `logf`) — other
 platforms' libm may flip near-tie mode choices, which still yields a

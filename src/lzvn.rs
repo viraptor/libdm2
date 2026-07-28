@@ -7,9 +7,9 @@
 /// back-references (matches). Each opcode's type is determined by bit
 /// patterns in the first byte, dispatched through a 256-entry table.
 ///
-/// We use an external lzfse, but reimplement lzvn - this is stupid.
-/// Future goal - either split this out as its own library or convince
-/// another lzfse crate to expose the lzvn interface publicly.
+/// The encoder is a compatible reimplementation (not byte-identical to
+/// Apple's match finder); the decoder accepts the same streams. The LZFSE
+/// container codec lives in the `lzfse` module and is a faithful port.
 
 // ------------------------------------------------------------------
 //  Decoder

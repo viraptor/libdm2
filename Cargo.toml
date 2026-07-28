@@ -8,6 +8,3 @@ authors = ["Stan Pitucha"] # but mostly LLM
 
 [lib]
 crate-type = ["cdylib", "rlib"]
-
-[build-dependencies]
-pkg-config = "0.3"
