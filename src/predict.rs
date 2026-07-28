@@ -26,64 +26,6 @@ impl PredictMode {
     }
 }
 
-fn cost(residuals: &[i16]) -> f32 {
-    residuals.iter().map(|&r| (r as f32).abs()).sum()
-}
-
-/// Select the best prediction mode for a row and write residuals into `out`.
-/// `prev_row` is None for the first row of the image.
-pub fn predict_row(
-    row: &[i16],
-    prev_row: Option<&[i16]>,
-    out: &mut [i16],
-    scratch: &mut [i16],
-) -> PredictMode {
-    let w = row.len();
-    debug_assert_eq!(out.len(), w);
-    debug_assert!(scratch.len() >= w);
-
-    // None
-    out[..w].copy_from_slice(row);
-    let mut best_cost = cost(out);
-    let mut best_mode = PredictMode::None;
-
-    // Left
-    scratch[0] = row[0];
-    for i in 1..w {
-        scratch[i] = row[i].wrapping_sub(row[i - 1]);
-    }
-    let c = cost(scratch);
-    if c < best_cost {
-        best_cost = c;
-        best_mode = PredictMode::Left;
-        out[..w].copy_from_slice(&scratch[..w]);
-    }
-
-    if let Some(prev) = prev_row {
-        // Apple prefers Up over UpLeft in ties: test Up first with strict <,
-        // then UpLeft with strict < — Up wins ties because it's set first.
-
-        // Up
-        for i in 0..w {
-            scratch[i] = row[i].wrapping_sub(prev[i]);
-        }
-        let c = cost(scratch);
-        if c < best_cost {
-            best_cost = c;
-            best_mode = PredictMode::Up;
-            out[..w].copy_from_slice(&scratch[..w]);
-        }
-
-        // UpLeft is not used in the mode-selection heuristic for 8-bit gray —
-        // Apple's encoder for type 2 appears to only select among None/Left/Up.
-        // (UpLeft as mode 1 appears in Apple's output for specific multi-channel
-        // cases via _RowEncodeYCC, not through the predict_row cost comparison.)
-        let _ = best_cost;
-    }
-
-    best_mode
-}
-
 /// Reverse a prediction to recover original values.
 ///
 /// Returns `Err(Dm2Error::DecodeFailed)` if the mode requires a previous

@@ -42,10 +42,20 @@ typedef struct {
     uint32_t format;
 } dm2_image_info_t;
 
-/* Encode pixels to deepmap2. Output is allocated; free with dm2_free(). */
+/* Encode pixels to deepmap2. Output is allocated; free with dm2_free().
+ * Defaults: quality 0; param 10 for 16-bit formats. */
 int dm2_encode(const uint8_t *pixels, size_t pixels_len,
                const dm2_image_info_t *info, uint32_t compression,
                uint8_t **out, size_t *out_len);
+
+/* Encode with explicit Deepmap2Options semantics. quality: 0 or 1 (1
+ * halves type-2 chroma — Apple's lossy mode). param: the 16-bit
+ * fixed-point scale exponent, 9..=12 (required for 16-bit formats;
+ * stored but payload-inert for 8-bit). compression must be 1-4. */
+int dm2_encode_opts(const uint8_t *pixels, size_t pixels_len,
+                    const dm2_image_info_t *info, uint32_t compression,
+                    uint32_t quality, uint32_t param,
+                    uint8_t **out, size_t *out_len);
 
 /* Decode deepmap2 data into pixel buffer. info is filled on success.
  * Output is the stream's NATIVE depth, matching vImageDeepmap2Decode:

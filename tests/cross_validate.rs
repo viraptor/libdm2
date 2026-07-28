@@ -552,6 +552,115 @@ fn cross_16bit_default_decoder_equality(fmt: PixelFormat) {
 #[test] fn cross_rgb16_default_decoder_equality()   { cross_16bit_default_decoder_equality(PixelFormat::Rgb16); }
 #[test] fn cross_rgba16_default_decoder_equality()  { cross_16bit_default_decoder_equality(PixelFormat::Rgba16); }
 
+/// The type-2 ENCODER contract: our encoder replicates Apple's
+/// pipeline exactly — quantization, YCoCg lanes, logf-cost mode selection,
+/// residual coding, tiling — so the stream must carry the SAME header and
+/// byte-identical intermediate buffers (decompressed tiles). Compressed
+/// bytes differ (our LZFSE match finder isn't Apple's), which is invisible
+/// after decompression.
+fn assert_same_intermediate(label: &str, ours: &[u8], apple: &[u8], format: PixelFormat) {
+    assert_eq!(&ours[..12], &apple[..12], "[{label}] header differs");
+    let k = match format {
+        PixelFormat::Gray8 | PixelFormat::Gray16 => 2,
+        PixelFormat::GrayA8 | PixelFormat::GrayA16 => 3,
+        PixelFormat::Rgb8 | PixelFormat::Rgb16 => 6,
+        PixelFormat::Rgba8 | PixelFormat::Rgba16 => 7,
+    };
+    let w = u16::from_le_bytes([apple[8], apple[9]]) as usize;
+    let tile_h = u16::from_le_bytes([apple[10], apple[11]]) as usize;
+    let mut off_a = 12usize;
+    let mut off_o = 12usize;
+    let mut tile = 0;
+    while off_a < apple.len() || off_o < ours.len() {
+        let sz_a = u32::from_le_bytes(apple[off_a..off_a + 4].try_into().unwrap()) as usize;
+        let sz_o = u32::from_le_bytes(ours[off_o..off_o + 4].try_into().unwrap()) as usize;
+        // Tile row count is only needed for the buffer bound; the last tile
+        // may be short, so use the padded full-tile size as the cap for both.
+        let cap = (tile_h * (k * w + 1) + 15) & !15;
+        let buf_a = libdm2::lzfse::decompress(&apple[off_a + 4..off_a + 4 + sz_a], cap)
+            .unwrap_or_else(|e| panic!("[{label}] tile {tile}: apple tile decompress failed: {e}"));
+        let buf_o = libdm2::lzfse::decompress(&ours[off_o + 4..off_o + 4 + sz_o], cap)
+            .unwrap_or_else(|e| panic!("[{label}] tile {tile}: our tile decompress failed: {e}"));
+        if buf_a != buf_o {
+            let first = buf_a.iter().zip(&buf_o).position(|(a, b)| a != b);
+            panic!(
+                "[{label}] tile {tile}: intermediate buffers differ (apple {} vs ours {} bytes, first diff {:?})",
+                buf_a.len(), buf_o.len(), first
+            );
+        }
+        off_a += 4 + sz_a;
+        off_o += 4 + sz_o;
+        tile += 1;
+    }
+    assert_eq!(off_a, apple.len(), "[{label}] apple stream trailing bytes");
+    assert_eq!(off_o, ours.len(), "[{label}] our stream trailing bytes");
+}
+
+/// 8-bit type 2: our encoder's intermediate buffers must be byte-identical
+/// to Apple's for the same input, across both qualities.
+#[test]
+fn cross_default_encoder_intermediate_8bit() {
+    let Some(api) = apple_api() else { return };
+    use PixelFormat::*;
+    for &fmt in &[Gray8, GrayA8, Rgb8, Rgba8] {
+        let sizes: &[(u32, u32)] = &[(24, 16), (64, 64), (33, 17), (3, 3), (9, 1), (1, 9), (256, 2200)];
+        for &(w, h) in sizes {
+            for (name, pixels) in [
+                ("gradient", gradient(w, h, fmt)),
+                ("checker", checker(w, h, fmt)),
+                ("random", random(w, h, fmt, (w as u64) << 16 | h as u64)),
+            ] {
+                let info = ImageInfo { width: w, height: h, format: fmt };
+                for quality in 0..=1u32 {
+                    let label = format!("enc16i/{fmt:?}/{name}_{w}x{h}/q{quality}");
+                    let Some(apple) =
+                        apple_encode_opts(&api, &pixels, &info, Compression::Default, quality, 0)
+                    else {
+                        continue; // Apple rejects (e.g. < 4 px); nothing to compare
+                    };
+                    let ours = dm2_encode_opts(&pixels, &info, Compression::Default, quality as u8, 0)
+                        .unwrap_or_else(|e| panic!("[{label}] our encode failed: {e}"));
+                    assert_same_intermediate(&label, &ours, &apple, fmt);
+                }
+            }
+        }
+    }
+}
+
+/// 16-bit type 2: same intermediate-identity contract across the full
+/// param × quality grid.
+#[test]
+fn cross_default_encoder_intermediate_16bit() {
+    let Some(api) = apple_api() else { return };
+    use PixelFormat::*;
+    for &fmt in &[Gray16, GrayA16, Rgb16, Rgba16] {
+        let sizes: &[(u32, u32)] = &[(24, 16), (64, 64), (33, 17), (256, 2200)];
+        for &(w, h) in sizes {
+            for (name, pixels) in [
+                ("halfs", sane_halfs_16(w, h, fmt, (w as u64) << 20 | h as u64)),
+                ("garbage", random(w, h, fmt, 0xBAD5EED ^ ((w as u64) << 8) ^ h as u64)),
+            ] {
+                let info = ImageInfo { width: w, height: h, format: fmt };
+                for quality in 0..=1u32 {
+                    for param in 9..=12u32 {
+                        let label = format!("enc16i/{fmt:?}/{name}_{w}x{h}/q{quality}p{param}");
+                        let Some(apple) = apple_encode_opts(
+                            &api, &pixels, &info, Compression::Default, quality, param,
+                        ) else {
+                            continue;
+                        };
+                        let ours = dm2_encode_opts(
+                            &pixels, &info, Compression::Default, quality as u8, param as u8,
+                        )
+                        .unwrap_or_else(|e| panic!("[{label}] our encode failed: {e}"));
+                        assert_same_intermediate(&label, &ours, &apple, fmt);
+                    }
+                }
+            }
+        }
+    }
+}
+
 #[test]
 fn cross_palette_rgba8() {
     let Some(api) = apple_api() else { return };

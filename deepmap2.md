@@ -194,7 +194,8 @@ Raw tile data capped at ~2 MB (2,097,152 bytes). Tile width = image width.
 
 Uses a **color transform → adaptive prediction → zigzag → byte-plane split → LZFSE** pipeline.
 Tiles use the same `[uint32_le size][compressed_data]` framing as type 3.
-Tiling threshold: ~1 MB (1,044,480 bytes) based on raw pixel data.
+Tile height comes from the shared 2 MiB budget over intermediate-buffer
+row bytes: `tileH = min(H, 0x200000 / (K*W + 16))` (see "Tiling").
 
 ### Intermediate buffer
 
@@ -293,11 +294,27 @@ uniformly to all residuals as described below.
 | 3    | Up       | pred = prev_row[i]                               |
 | 4    | Mean     | pred = (left + up + 1) / 2 with truncation fix  |
 
-**Mode selection heuristic**: The encoder computes the sum of absolute residuals (L1 cost)
-for each candidate mode and picks the minimum.
+**Mode selection heuristic** an earlier L1-cost note here was
+wrong): per row, the encoder evaluates candidate modes in the fixed order
+**None(0), Left(2), Up(3), Mean(4), Paeth(1)** — row 0 evaluates only
+None, Left — and a candidate wins only with a **strictly smaller** cost
+(ties keep the earlier mode). The cost is a bit-rate estimate:
 
-- Row 0: only modes 0 and 2 are candidates.
-- Rows 1+: modes 0, 2, and 3 are candidates for gray. Multi-channel uses all 5 modes.
+```
+cost = Σ over all 3W lanes of logf((float)(1.0 + |residual|))
+```
+
+computed with `logf` from libm and accumulated **sequentially in f32** in
+lane order (the Paeth kernel groups per pixel: `s += (ly + lco) + lcg`).
+The f32 accumulation order matters: near-ties are decided by ULP-level
+rounding, so a reimplementation must replicate both the order and the
+platform `logf` to match Apple's mode bytes exactly.
+
+Every format uses all 5 modes (gray included — the old claim that gray
+uses only 0/2/3 was wrong). Row values are always THREE i16 lanes per
+pixel: (Y, Co, Cg) for RGB formats, **(Y, 0, 0)** for gray/gray+alpha
+(Apple's "Y00" — the zero lanes cost `logf(1) = 0` and are simply not
+stored in the plane split).
 
 **2-way Paeth (mode 1)**: At position `i > 0`:
 ```
@@ -316,6 +333,14 @@ pred = sum >> 1
 ```
 At position `i = 0`: `pred = up[0]`.
 
+**Encoder/decoder width asymmetry**: the ENCODER computes residuals in
+32-bit registers over sign-extended i16 values and wraps the result to
+i16 at store time; Mean's `left+up+1` sum and the Paeth select math do
+NOT wrap at i16 in the encoder. The DECODER's reconstruction runs in
+i16-wrapping lanes (including Mean's sum — differentially verified).
+For sane values both agree; for out-of-range 16-bit codes they diverge,
+which is exactly Apple's own encode→decode corruption on garbage input.
+
 ### Negative residual adjustment
 
 After computing the prediction residual (`value - predicted`), the encoder decrements
@@ -327,14 +352,18 @@ if residual < 0: residual -= 1
 
 The decoder reverses this: `if residual < 0: residual += 1`.
 
-This applies uniformly to Y, Co, Cg, and gray channels. It improves zigzag coding
-efficiency by shifting the distribution of negative residuals.
+This applies uniformly to Y, Co, Cg, and gray channels, unconditionally
+across ALL modes including None (an earlier note claiming gray skips the
+adjustment for mode 0 was indistinguishable for 8-bit — gray8 mode-0
+values are never negative — and is disproven by gray16). It improves
+zigzag coding efficiency by shifting the distribution of negative
+residuals; for Co/Cg it also serves as the "color decrement" — there is
+no separate per-channel adjustment in the color transform itself.
 
-For the gray encoder, the adjustment is applied to all modes except None (mode 0).
-For the multi-channel encoder, the adjustment is applied to all values unconditionally
-(including mode 0 base values). In the multi-channel case, this effectively serves as
-the "color decrement" for Co/Cg — there is no separate per-channel adjustment in the
-color transform itself.
+The adjustment happens in a WIDE register on the i16-wrapped residual:
+`-32768` becomes `-32769` (no wrap), whose 32-bit zigzag `0x10001`
+truncates to a stored `0x0001` — observable in real streams whenever a
+residual lands exactly on `-32768`.
 
 ### Zigzag encoding
 
@@ -347,10 +376,13 @@ zigzag_decode(z) = (z >> 1) ^ -(z & 1)
 
 ### Previous-row tracking
 
-For prediction modes that reference the previous row (Up, UpLeft, Mean), the encoder
-and decoder track the **reconstructed values** from the previous row as the reference.
+For prediction modes that reference the previous row (Up, UpLeft, Mean),
+the ENCODER references the previous row's ORIGINAL (loader-output) i16
+values, and the DECODER its reconstructed values — identical in-domain,
+since residual coding is exact over the i16 lanes.
 
-- **Gray**: Previous row values are the actual pixel values (u8, 0–255).
+- **Gray**: Previous row values are the actual pixel values (u8 for
+  Gray8; i16-truncated fixed-point codes for Gray16).
 - **Multi-channel**: Previous row values are the YCoCg values after zigzag decode +
   un-adjustment. These are the original (un-decremented) color transform outputs.
 
@@ -362,9 +394,11 @@ and decoder track the **reconstructed values** from the previous row as the refe
   exactly the maxerr=1 on R/G channels (measured on both RGB and RGBA; an
   earlier note claiming RGB stayed lossless at quality=1 was wrong).
 - quality ≥ 2: Encoder returns failure.
-- param: Stored in header, no effect on 8-bit output (verified: q1/p0 and q1/p10
-  encode byte-identically; the chroma-scale switch is the QUALITY byte, not param).
-  For 16-bit formats param selects the fixed-point scale (see below).
+- param: Stored verbatim in header byte 6; no effect on 8-bit PAYLOADS
+  (q1/p0 and q1/p10 payloads are byte-identical — the chroma-scale switch is
+  the QUALITY byte, not param; concretely the chroma divisor is
+  `1 << quality` via SDIV in the row loaders). For 16-bit formats param
+  selects the fixed-point scale (see below).
 
 ### 16-bit formats (all reverse-engineered)
 
@@ -418,13 +452,46 @@ misread the quantization loss measured on raw bit patterns (a small float error
 across a half-float exponent boundary produces a huge bit-pattern delta). Apple's
 decoder is deterministic and correct for these streams.
 
-The tiling budget also differs for 16-bit type 2: 1024-wide RGBA16 uses
-tileHeight 291 ≈ 1,044,480 / (W × K/2) — i.e. the budget appears to be computed
-on intermediate-buffer bytes, not the 8-byte raw pixels. Decoders need not care
-(tileHeight is in the header); only an encoder implementation would.
-
 Type 1 (None) fails to encode 16-bit data in Apple's implementation; type 3
 (Lossless) is format-agnostic and works for all 16-bit formats.
+
+### The encoder pipeline
+
+Found from lots of synthetic inputs/outputs, then verified byte-identical
+against `vImageDeepmap2Encode` intermediate buffers on a 480-stream corpus plus
+all-65536-halfs sweep images (every format × quality × param, including garbage
+inputs):
+
+1. **Row loading** (per-format `DeepmapConvertRow*` table): each row
+   becomes 3 i16 lanes per pixel. 8-bit channels load directly; 16-bit
+   channels quantize as
+   `wrap16(sat_i32(round_ties_away(f32(half) × 2^(param-1))))`
+   (`frinta` → `fcvtzs` → `uzp1`; NaN → 0, ±Inf saturate i32 then
+   truncate). Gray formats produce `(Y, 0, 0)` ("Y00"); RGB formats run
+   YCoCg **in i16 lanes** (wrapping at every step, truncating `/2`), then
+   divide Co/Cg by `1 << quality` (`sdiv`, truncation). GrayA uses the
+   gray path (its Y is NOT YCC-transformed). 16-bit alpha converts as
+   `clamp(round_ties_away(a × 255), 0, 255)`.
+2. **Mode selection**: see "Mode selection heuristic" above — logf cost,
+   order None/Left/Up/Mean/Paeth, strict `<`.
+3. **Residuals**: 32-bit math over sign-extended i16 values, wrapped to
+   i16 at store; encoder Mean/Paeth do not wrap internally (see the
+   width-asymmetry note above).
+4. **Store**: negative adjust in a wide register, 32-bit zigzag, low 16
+   bits split into the high/low byte planes; LZFSE/LZVN per tile.
+
+Apple's type-2 encoder rejects images with fewer than 4 pixels.
+
+libdm2's type-2 encoder replicates this pipeline exactly: for identical
+input it produces byte-identical intermediate buffers (and therefore
+byte-identical decoded output through any correct decoder). The whole
+STREAM is still not byte-identical because the LZFSE/LZVN entropy stage
+uses a different match finder than Apple's; only the compressed bytes
+differ, not what they decompress to. Caveat: exact mode-byte fidelity
+depends on bit-exact `logf` and f32 accumulation order; libdm2 matches
+on macOS (Rust's `f32::ln` calls the same libsystem `logf`) — other
+platforms' libm may flip near-tie mode choices, which still yields a
+valid stream with identical reconstructed values.
 
 ## Compression Type 4 (Palette)
 
@@ -472,20 +539,29 @@ compression of the index stream.
 - Maximum 256 palette entries. Images with >256 distinct RGBA values cannot be palette-encoded.
 - Always lossless.
 - Quality and param fields stored in header, no effect on output.
-- Tiling uses the ~1 MB budget based on the index size (1 byte/pixel).
+- Tiling uses the shared 2 MiB budget over index bytes (1 byte/pixel).
 
 ## Tiling
 
 Tiling is only relevant for compressed formats; type 1 never tiles.
 
-Tile width always equals image width (full-width horizontal strips). Tile height is capped
-so raw tile data stays within a budget:
+Tile width always equals image width, capped at 16384 (full-width
+horizontal strips). `ComputeTileSize` derives the tile height from one
+shared budget of **0x200000 (2,097,152) bytes** applied to a per-row
+cost that depends on the compression type (fitted exactly against
+`vImageDeepmap2Encode` headers across formats and widths; the old
+per-type "1,044,480-byte raw budget" notes here were wrong):
 
-| Compression | Raw tile budget |
-|-------------|-----------------|
-| 2 (default) | 1,044,480 bytes |
-| 3 (lossless)| 2,097,152 bytes |
-| 4 (palette) | 1,044,480 bytes |
+| Compression | Per-row cost              | tileHeight                       |
+|-------------|---------------------------|----------------------------------|
+| 2 (default) | K×W + 16 (intermediate)   | min(H, 0x200000 / (K×W + 16))    |
+| 3 (lossless)| W × pixelSize (raw bytes) | min(H, 0x200000 / (W×pixelSize)) |
+| 4 (palette) | W (index bytes)           | min(H, 0x200000 / W)             |
+
+The type-2 cost is the intermediate-buffer bytes per row (`K*W + 1`
+rounded up to 16), which is why 8-bit and 16-bit formats of the same
+class tile identically (e.g. RGBA8 and RGBA16 at W=1024 both use
+tileHeight 291).
 
 All compressed types use sequential tile layout:
 ```
@@ -504,8 +580,9 @@ is expected behavior for the type 2 intermediate buffer).
 
 ## Minimum Image Size
 
-Apple's encoder returns failure (size 0) for 1×1 images across all compression types.
-Images of approximately ≥9 pixels (e.g. 3×3, 9×1) succeed.
+Apple's type-2 encoder accepts anything with at least 4 pixels (2×2, 4×1,
+1×8, 3×3 all succeed) and rejects 1×1, 2×1, and 1×2 (returns size 0). The
+earlier "≥9 pixels" estimate here was too conservative.
 
 ## Internal Functions (not exported, visible in symbols)
 

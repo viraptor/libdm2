@@ -145,17 +145,26 @@ fn lossless_non_square_rgb() { roundtrip_exact(30, 100, PixelFormat::Rgb8, Compr
 // ---------------------------------------------------------------------------
 
 #[test]
-fn default_small_falls_back_to_lossless() {
+fn default_small_images() {
+    // Apple's type-2 encoder handles anything down to 4 pixels (3x3
+    // included); below that (1x1, 2x1, 1x2) it rejects, and we fall back
+    // to lossless so the API always returns a valid stream.
     let px = vec![42u8; 9];
     let info = ImageInfo { width: 3, height: 3, format: PixelFormat::Gray8 };
     let enc = dm2_encode(&px, &info, Compression::Default).unwrap();
     let (ri, comp) = dm2_read_info(&enc).unwrap();
     assert_eq!(ri.width, 3);
-    assert_eq!(comp, Compression::Lossless, "small image should fall back to lossless");
+    assert_eq!(comp, Compression::Default, "3x3 encodes as real type 2 (like Apple)");
     let mut dec = vec![0u8; 9];
     let mut di = ImageInfo { width: 0, height: 0, format: PixelFormat::Gray8 };
     dm2_decode(&enc, &mut dec, &mut di).unwrap();
     assert_eq!(&dec, &px);
+
+    let px = vec![7u8, 9];
+    let info = ImageInfo { width: 2, height: 1, format: PixelFormat::Gray8 };
+    let enc = dm2_encode(&px, &info, Compression::Default).unwrap();
+    let (_ri, comp) = dm2_read_info(&enc).unwrap();
+    assert_eq!(comp, Compression::Lossless, "sub-4-pixel images fall back to lossless");
 }
 
 #[test]
@@ -380,10 +389,25 @@ fn pixel_size_16bit() {
 }
 
 #[test]
-fn encode_default_rejects_16bit() {
-    let px = vec![0u8; 64 * 64 * 2];
+fn encode_default_16bit_roundtrips() {
+    // Gray16 type 2 encodes (Apple's fixed-point scheme) and decodes back.
+    // Quantization at the default param 10 is exact for halves with
+    // magnitude in [1/512, 63] whose codes fit the scale, e.g. 1.0h.
+    let one = 0x3c00u16.to_le_bytes();
+    let px: Vec<u8> = std::iter::repeat(one).take(64 * 64).flatten().collect();
     let info = ImageInfo { width: 64, height: 64, format: PixelFormat::Gray16 };
-    assert!(dm2_encode(&px, &info, Compression::Default).is_err());
+    let enc = dm2_encode(&px, &info, Compression::Default).unwrap();
+    let (_ri, comp) = dm2_read_info(&enc).unwrap();
+    assert_eq!(comp, Compression::Default);
+    let mut dec = vec![0u8; px.len()];
+    let mut di = ImageInfo { width: 0, height: 0, format: PixelFormat::Gray8 };
+    dm2_decode(&enc, &mut dec, &mut di).unwrap();
+    assert_eq!(dec, px, "1.0h image should survive the fixed-point roundtrip exactly");
+
+    // Bad opts are rejected: quality >= 2, 16-bit param outside 9..=12.
+    assert!(dm2_encode_opts(&px, &info, Compression::Default, 2, 10).is_err());
+    assert!(dm2_encode_opts(&px, &info, Compression::Default, 0, 8).is_err());
+    assert!(dm2_encode_opts(&px, &info, Compression::Default, 0, 13).is_err());
 }
 
 #[test]

@@ -13,8 +13,23 @@ pub use format::{Compression, ImageInfo, PixelFormat};
 
 /// Encode pixel data into deepmap2 format.
 /// With `compression = None`, pass a specific type. For best compression, use `encode_auto`.
+/// Uses default options: quality 0, param 10 for 16-bit formats.
 pub fn dm2_encode(pixels: &[u8], info: &ImageInfo, compression: Compression) -> Result<Vec<u8>> {
     encode::encode(pixels, info, compression)
+}
+
+/// Encode with Apple semantics: `quality` (0 or 1 — 1 halves
+/// type-2 chroma, the documented lossy mode) and `param`
+/// (16-bit fixed-point scale exponent, 9..=12; ignored by
+/// 8-bit payloads but stored in the header).
+pub fn dm2_encode_opts(
+    pixels: &[u8],
+    info: &ImageInfo,
+    compression: Compression,
+    quality: u8,
+    param: u8,
+) -> Result<Vec<u8>> {
+    encode::encode_opts(pixels, info, compression, quality, param)
 }
 
 /// Encode with automatic compression selection (tries all methods, picks smallest).

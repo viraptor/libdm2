@@ -136,9 +136,49 @@ pub fn f32_to_f16_bits(x: f32) -> u16 {
     h as u16
 }
 
+/// Expand an IEEE half-float bit pattern to f32 (exact — every half is
+/// representable). Used by the 16-bit type-2 ENCODER: Apple quantizes
+/// half channel values to fixed-point codes via f32 arithmetic.
+pub fn f16_bits_to_f32(bits: u16) -> f32 {
+    let sign = ((bits >> 15) as u32) << 31;
+    let exp = ((bits >> 10) & 0x1f) as u32;
+    let mant = (bits & 0x3ff) as u32;
+    let f = if exp == 0 {
+        if mant == 0 {
+            sign // ±0
+        } else {
+            // Subnormal half: normalize into an f32 exponent.
+            let mut e = 127 - 15 + 1;
+            let mut m = mant;
+            while m & 0x400 == 0 {
+                m <<= 1;
+                e -= 1;
+            }
+            sign | ((e as u32) << 23) | ((m & 0x3ff) << 13)
+        }
+    } else if exp == 31 {
+        sign | 0x7f80_0000 | (mant << 13) // Inf / NaN
+    } else {
+        sign | ((exp + 127 - 15) << 23) | (mant << 13)
+    };
+    f32::from_bits(f)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn f16_to_f32_roundtrip_all() {
+        for bits in 0..=u16::MAX {
+            let f = f16_bits_to_f32(bits);
+            if f.is_nan() {
+                assert!(bits & 0x7c00 == 0x7c00 && bits & 0x3ff != 0);
+                continue;
+            }
+            assert_eq!(f32_to_f16_bits(f), bits, "bits={bits:04x}");
+        }
+    }
 
     #[test]
     fn ycocg_rgba_roundtrip() {

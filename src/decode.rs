@@ -1,6 +1,6 @@
 use crate::color::f32_to_f16_bits;
-use crate::encode::byte_planes_for;
 use crate::error::{Dm2Error, Result};
+use crate::format::byte_planes_for;
 use crate::format::*;
 use crate::lzfse;
 use crate::predict::{self, PredictMode};

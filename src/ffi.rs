@@ -123,6 +123,44 @@ pub unsafe extern "C" fn dm2_encode(
     }
 }
 
+/// Encode with explicit Apple semantics: `quality` (0 or 1 — 1 halves
+/// type-2 chroma, Apple's lossy mode) and `param` (16-bit fixed-point
+/// scale exponent, 9..=12; stored but payload-inert for 8-bit).
+/// `compression` must be a specific type (1-4), not 0/auto.
+#[no_mangle]
+pub unsafe extern "C" fn dm2_encode_opts(
+    pixels: *const u8, pixels_len: usize,
+    info: *const Dm2ImageInfo,
+    compression: u32,
+    quality: u32, param: u32,
+    out: *mut *mut u8, out_len: *mut usize,
+) -> i32 {
+    if pixels.is_null() || info.is_null() || out.is_null() || out_len.is_null() {
+        return Dm2Error::InvalidArg as i32;
+    }
+    if quality > 255 || param > 255 {
+        return Dm2Error::InvalidArg as i32;
+    }
+    let info_r = match ImageInfo::try_from(&*info) {
+        Ok(i) => i,
+        Err(e) => return e as i32,
+    };
+    let Some(comp) = compression_from_u32(compression) else {
+        return Dm2Error::InvalidArg as i32;
+    };
+    let pix = slice::from_raw_parts(pixels, pixels_len);
+    match crate::dm2_encode_opts(pix, &info_r, comp, quality as u8, param as u8) {
+        Ok(encoded) => {
+            let len = encoded.len();
+            let ptr = encoded.leak().as_mut_ptr();
+            *out = ptr;
+            *out_len = len;
+            0
+        }
+        Err(e) => e as i32,
+    }
+}
+
 /// Decode deepmap2 data into a pixel buffer.
 /// `info` is filled with width/height/format on success.
 #[no_mangle]

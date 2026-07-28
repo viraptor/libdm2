@@ -210,22 +210,34 @@ impl Header {
     }
 }
 
-/// Compute tile height for a given compression type and image dimensions.
-/// Tiles are full-width horizontal strips capped by a raw data budget.
-pub fn compute_tile_height(compression: Compression, width: u32, height: u32, pixel_size: usize) -> u32 {
-    let budget: usize = match compression {
+/// Number of byte-planes per pixel position in the type-2 intermediate
+/// buffer (identical for a format and its 16-bit counterpart).
+pub(crate) fn byte_planes_for(format: PixelFormat) -> usize {
+    match format {
+        PixelFormat::Gray8  | PixelFormat::Gray16  => 2,
+        PixelFormat::GrayA8 | PixelFormat::GrayA16 => 3,
+        PixelFormat::Rgb8   | PixelFormat::Rgb16   => 6,
+        PixelFormat::Rgba8  | PixelFormat::Rgba16  => 7,
+    }
+}
+
+/// Compute tile height the way Apple's `ComputeTileSize` does: full-width
+/// horizontal strips capped so a per-row cost fits a 2 MiB (0x200000)
+/// budget. The per-row cost depends on the compression type (fitted
+/// against `vImageDeepmap2Encode` headers across formats and widths):
+///
+/// - Lossless: raw row bytes (`w * pixel_size`)
+/// - Default:  intermediate-buffer row bytes (`K*w + 1` rounded to 16)
+/// - Palette:  index row bytes (`w`)
+pub fn compute_tile_height(compression: Compression, width: u32, height: u32, format: PixelFormat) -> u32 {
+    const BUDGET: usize = 0x20_0000;
+    let w = width as usize;
+    let row_cost: usize = match compression {
         Compression::None => return height, // no tiling
-        Compression::Default | Compression::Palette => 1_044_480,
-        Compression::Lossless => 2_097_152,
+        Compression::Lossless => w * format.pixel_size(),
+        Compression::Default => byte_planes_for(format) * w + 16,
+        Compression::Palette => w,
     };
-    let row_bytes = width as usize * pixel_size;
-    if row_bytes == 0 {
-        return height;
-    }
-    let max_rows = budget / row_bytes;
-    if max_rows == 0 {
-        1
-    } else {
-        height.min(max_rows as u32)
-    }
+    let max_rows = BUDGET / row_cost.max(1);
+    height.min(max_rows.max(1) as u32)
 }
