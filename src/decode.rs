@@ -119,11 +119,9 @@ where
 
 fn decode_default(data: &[u8], hdr_len: usize, pixels: &mut [u8], info: &ImageInfo, header: &Header) -> Result<()> {
     if info.format.is_16bit() {
-        // Only RGBA16 (0x14) has been reverse-engineered against real
-        // streams. Apple requires param 9..=12 for 16-bit formats — it
-        // selects the fixed-point scale (2^(param-1)) of the stored
-        // channel codes.
-        if info.format != PixelFormat::Rgba16 || !(9..=12).contains(&header.param) {
+        // Apple requires param 9..=12 for 16-bit formats — it selects the
+        // fixed-point scale (2^(param-1)) of the stored channel codes.
+        if !(9..=12).contains(&header.param) {
             return Err(Dm2Error::BadFormat);
         }
     }
@@ -153,9 +151,10 @@ fn decode_default_tile(tile_data: &[u8], pixels: &mut [u8], w: usize, h: usize, 
     if decompressed.len() < min_size || decompressed.len() > buf_size {
         return Err(Dm2Error::DecodeFailed);
     }
-    // Caller passed `pixels[pix_start..pix_end]` sized `rows * row_bytes`,
-    // i.e. exactly h*w bytes for a 1-channel format. Verify defensively.
-    if pixels.len() < plane {
+    // Caller passed `pixels[pix_start..pix_end]` sized `rows * row_bytes`.
+    // Verify defensively.
+    let ps = format.pixel_size();
+    if pixels.len() < plane.checked_mul(ps).ok_or(Dm2Error::BadFormat)? {
         return Err(Dm2Error::BufferTooSmall);
     }
 
@@ -181,12 +180,32 @@ fn decode_default_tile(tile_data: &[u8], pixels: &mut [u8], w: usize, h: usize, 
         let prev_ref = if row > 0 { Some(prev.as_slice()) } else { None };
         predict::unpredict_row(&residuals, prev_ref, mode, &mut cur)?;
 
-        let row_pixels = &mut pixels[row * w..(row + 1) * w];
-        for i in 0..w {
-            row_pixels[i] = cur[i].clamp(0, 255) as u8;
-        }
-        for i in 0..w {
-            prev[i] = row_pixels[i] as i16;
+        let row_pixels = &mut pixels[row * w * ps..(row + 1) * w * ps];
+        match format {
+            PixelFormat::Gray8 => {
+                // Output clamps to u8, and the CLAMPED value feeds the next
+                // row's prediction (matches Apple's 8-bit gray decoder).
+                for i in 0..w {
+                    row_pixels[i] = cur[i].clamp(0, 255) as u8;
+                    prev[i] = row_pixels[i] as i16;
+                }
+            }
+            PixelFormat::Gray16 => {
+                // Same plane layout as Gray8; the reconstructed integers are
+                // fixed-point codes of half-float values (scale 2^(param-1)),
+                // and the UNCLAMPED code feeds the next row's prediction —
+                // verified byte-identical to vImageDeepmap2Decode across the
+                // full param 9..=12 × quality grid. Quality has no effect
+                // (no chroma planes), same as 8-bit gray.
+                let scale = (1u32 << (param - 1)) as f32;
+                for i in 0..w {
+                    let half = f32_to_f16_bits(cur[i] as f32 / scale);
+                    row_pixels[i * 2..i * 2 + 2].copy_from_slice(&half.to_le_bytes());
+                    prev[i] = cur[i];
+                }
+            }
+            // Multi-channel formats were dispatched to the YCC decoder above.
+            _ => return Err(Dm2Error::BadFormat),
         }
     }
 
@@ -364,6 +383,38 @@ fn decode_default_tile_ycc(tile_data: &[u8], pixels: &mut [u8], w: usize, h: usi
                     row_pixels[i * 2 + 1] = buf[row * w + i];
                 }
             }
+            PixelFormat::GrayA16 => {
+                // Same K=3 layout as GrayA8 (8-bit alpha plane + Y hi/lo
+                // planes); the Y codes are fixed-point half-float values,
+                // alpha expands to half(a/255) — exactly the RGBA16 output
+                // rule minus the chroma channels. Quality has no effect
+                // (no chroma), same as GrayA8.
+                let scale = (1u32 << (param - 1)) as f32;
+                for i in 0..w {
+                    let a = buf[row * w + i];
+                    let px = &mut row_pixels[i * 4..i * 4 + 4];
+                    px[0..2].copy_from_slice(&f32_to_f16_bits(cur_y[i] as f32 / scale).to_le_bytes());
+                    px[2..4].copy_from_slice(&f32_to_f16_bits(a as f32 / 255.0).to_le_bytes());
+                }
+            }
+            PixelFormat::Rgb16 => {
+                // RGBA16's output rule without the alpha plane (K=6, same
+                // layout as RGB8): wrapping inverse YCoCg on fixed-point
+                // codes, half-scale chroma when quality != 0.
+                let scale = (1u32 << (param - 1)) as f32;
+                for i in 0..w {
+                    let co = cur_co[i].wrapping_mul(chroma_scale);
+                    let cg = cur_cg[i].wrapping_mul(chroma_scale);
+                    let t = cur_y[i].wrapping_sub(cg / 2);
+                    let g = cg.wrapping_add(t);
+                    let b = t.wrapping_sub(co / 2);
+                    let r = co.wrapping_add(b);
+                    let px = &mut row_pixels[i * 6..i * 6 + 6];
+                    px[0..2].copy_from_slice(&f32_to_f16_bits(r as f32 / scale).to_le_bytes());
+                    px[2..4].copy_from_slice(&f32_to_f16_bits(g as f32 / scale).to_le_bytes());
+                    px[4..6].copy_from_slice(&f32_to_f16_bits(b as f32 / scale).to_le_bytes());
+                }
+            }
             PixelFormat::Rgba16 => {
                 // 16-bit type 2 uses the SAME intermediate layout as RGBA8
                 // (1-byte alpha plane + 16-bit YCoCg zigzag residuals in
@@ -396,10 +447,9 @@ fn decode_default_tile_ycc(tile_data: &[u8], pixels: &mut [u8], w: usize, h: usi
                     px[6..8].copy_from_slice(&f32_to_f16_bits(a as f32 / 255.0).to_le_bytes());
                 }
             }
-            // 1-channel and the un-reverse-engineered 16-bit formats
-            // (Gray16/GrayA16/Rgb16) are routed away before reaching here;
-            // reject explicitly rather than panic if a future caller breaks
-            // the dispatch invariant.
+            // 1-channel formats are routed to the gray decoder before
+            // reaching here; reject explicitly rather than panic if a
+            // future caller breaks the dispatch invariant.
             _ => return Err(Dm2Error::BadFormat),
         }
 

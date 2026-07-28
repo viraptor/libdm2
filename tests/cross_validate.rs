@@ -342,8 +342,8 @@ fn run_format(fmt: PixelFormat) {
     let compressions: &[Compression] = if fmt.is_16bit() {
         // check_pair starts from OUR encoder, and we only implement
         // Lossless for 16-bit (Apple's 16-bit type 2 is a lossy fixed-
-        // point scheme we don't encode). Decode of Apple-encoded RGBA16
-        // type 2 is covered by cross_rgba16_default below.
+        // point scheme we don't encode). Decode of Apple-encoded 16-bit
+        // type 2 is covered by cross_*16_default_decoder_equality below.
         &[Compression::Lossless]
     } else {
         &[
@@ -470,14 +470,14 @@ fn cross_default_quality_param_grid() {
     }
 }
 
-/// Generate an RGBA16 image of VALID half-float pixels with |value| < 4.0
+/// Generate a 16-bit image of VALID half-float pixels with |value| < 4.0
 /// (exponent field <= 16), the amplitude regime real .car EDR icons live in
 /// (known sample peak is ~1.0; codes stay far below the i16 fixed-point limit
 /// at every legal param). Raw byte-noise generators produce NaN/Inf/huge
 /// halfs whose fixed-point codes overflow i16 inside Apple's ENCODER —
-/// see the doc comment on cross_rgba16_default_decoder_equality.
-fn sane_halfs_rgba16(w: u32, h: u32, seed: u64) -> Vec<u8> {
-    let n = w as usize * h as usize * 4;
+/// see the doc comment on cross_16bit_default_decoder_equality.
+fn sane_halfs_16(w: u32, h: u32, fmt: PixelFormat, seed: u64) -> Vec<u8> {
+    let n = w as usize * h as usize * fmt.channels();
     let mut p = Vec::with_capacity(n * 2);
     let mut s = seed.wrapping_mul(0x9E3779B97F4A7C15);
     for _ in 0..n {
@@ -492,13 +492,14 @@ fn sane_halfs_rgba16(w: u32, h: u32, seed: u64) -> Vec<u8> {
     p
 }
 
-/// RGBA16 type 2 (#128): Apple encodes 16-bit pixels as fixed-point codes of
+/// 16-bit type 2 (#128): Apple encodes 16-bit pixels as fixed-point codes of
 /// the half-float channel values (scale 2^(param-1), param 9..=12) in the
-/// same K=7 plane layout as RGBA8, with an 8-bit alpha plane. Encoding is
-/// lossy, so round-tripping against the ORIGINAL pixels is meaningless —
-/// the contract is decoder equality: for the same stream, our decode must be
-/// byte-identical to vImageDeepmap2Decode. Covers every legal param and both
-/// legal qualities.
+/// same K plane layout as the corresponding 8-bit format (Gray16 K=2,
+/// GrayA16 K=3, Rgb16 K=6, Rgba16 K=7), with an 8-bit alpha plane for the
+/// alpha formats. Encoding is lossy, so round-tripping against the ORIGINAL
+/// pixels is meaningless — the contract is decoder equality: for the same
+/// stream, our decode must be byte-identical to vImageDeepmap2Decode.
+/// Covers every legal param and both legal qualities.
 ///
 /// Input domain: valid halfs, |v| < 4.0. When a garbage half (NaN/Inf/2^13)
 /// meets the fixed-point quantizer, Apple's encoder WRAPS the code at i16 and
@@ -509,21 +510,19 @@ fn sane_halfs_rgba16(w: u32, h: u32, seed: u64) -> Vec<u8> {
 /// an intentionally unchased corner: Apple's own encode of such input is
 /// already total value corruption, and no real encoder emits it (every .car
 /// rendition observed is quality=1 param=10 with |v| ~<= 1).
-#[test]
-fn cross_rgba16_default_decoder_equality() {
+fn cross_16bit_default_decoder_equality(fmt: PixelFormat) {
     let Some(api) = apple_api() else { return };
-    let fmt = PixelFormat::Rgba16;
     let sizes: &[(u32, u32)] = &[(16, 16), (33, 17), (64, 64), (128, 9), (1, 64), (64, 1), (256, 2200)];
     let mut samples: Vec<(String, u32, u32, Vec<u8>)> = Vec::new();
     for &(w, h) in sizes {
-        samples.push((format!("halfs_{w}x{h}"), w, h, sane_halfs_rgba16(w, h, (w as u64) << 20 | h as u64)));
+        samples.push((format!("halfs_{w}x{h}"), w, h, sane_halfs_16(w, h, fmt, (w as u64) << 20 | h as u64)));
     }
     samples.push(("solid0_32x32".into(), 32, 32, solid(32, 32, fmt, 0)));
     for (name, w, h, pixels) in samples {
         let info = ImageInfo { width: w, height: h, format: fmt };
         for param in 9..=12u32 {
             for quality in 0..=1u32 {
-                let label = format!("rgba16_default/{name}/q{quality}p{param}");
+                let label = format!("{fmt:?}_default/{name}/q{quality}p{param}");
                 let Some(enc) =
                     apple_encode_opts(&api, &pixels, &info, Compression::Default, quality, param)
                 else {
@@ -547,6 +546,11 @@ fn cross_rgba16_default_decoder_equality() {
         }
     }
 }
+
+#[test] fn cross_gray16_default_decoder_equality()  { cross_16bit_default_decoder_equality(PixelFormat::Gray16); }
+#[test] fn cross_graya16_default_decoder_equality() { cross_16bit_default_decoder_equality(PixelFormat::GrayA16); }
+#[test] fn cross_rgb16_default_decoder_equality()   { cross_16bit_default_decoder_equality(PixelFormat::Rgb16); }
+#[test] fn cross_rgba16_default_decoder_equality()  { cross_16bit_default_decoder_equality(PixelFormat::Rgba16); }
 
 #[test]
 fn cross_palette_rgba8() {

@@ -387,13 +387,14 @@ fn encode_default_rejects_16bit() {
 }
 
 #[test]
-fn decode_default_rejects_16bit() {
+fn decode_default_rejects_16bit_bad_param() {
+    // 16-bit type 2 IS supported, but only for param 9..=12 (the fixed-point
+    // scale); this header's param=0 must be rejected before tile decode.
     let mut hdr = vec![0u8; 16 + 4];
     hdr[0..4].copy_from_slice(b"dmp2");
     hdr[4] = 2; // default
     hdr[7] = 0x11; // Gray16
     hdr[8] = 8; hdr[10] = 8;
-    // tile size = 0 (will trigger error after format check)
     let mut out = vec![0u8; 128];
     let mut info = ImageInfo { width: 0, height: 0, format: PixelFormat::Gray8 };
     assert!(dm2_decode(&hdr, &mut out, &mut info).is_err());

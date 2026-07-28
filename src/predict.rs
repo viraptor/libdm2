@@ -127,14 +127,17 @@ pub fn unpredict_row(
             }
         }
         PredictMode::Mean => {
-            // (left + up + 1) / 2 with truncation-toward-zero for negative sums
+            // (left + up + 1) / 2 with truncation-toward-zero for negative
+            // sums. The sum WRAPS at i16 before the truncation fix and
+            // shift, matching Apple's 16-bit lanes (see the YCC decoder's
+            // mean16) — behavior-neutral for 8-bit gray, where the sum can
+            // never leave i16, but load-bearing for Gray16 codes near ±32768.
             let prev = needs_prev()?;
             out[0] = residuals[0].wrapping_add(prev[0]); // x=0: pred = up
             for i in 1..w {
-                let mut sum = out[i - 1] as i32 + prev[i] as i32 + 1;
+                let mut sum = out[i - 1].wrapping_add(prev[i]).wrapping_add(1);
                 if sum < 0 { sum += 1; } // truncation toward zero correction
-                let pred = (sum >> 1) as i16;
-                out[i] = residuals[i].wrapping_add(pred);
+                out[i] = residuals[i].wrapping_add(sum >> 1);
             }
         }
     }
