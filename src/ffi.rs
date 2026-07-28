@@ -101,7 +101,11 @@ pub unsafe extern "C" fn dm2_encode(
         Err(e) => return e as i32,
     };
     let pix = slice::from_raw_parts(pixels, pixels_len);
+    if compression != 0 && compression_from_u32(compression).is_none() {
+        return Dm2Error::InvalidArg as i32;
+    }
 
+    guard(move || {
     let result = if compression == 0 {
         crate::dm2_encode_auto(pix, &info_r)
     } else {
@@ -113,14 +117,21 @@ pub unsafe extern "C" fn dm2_encode(
 
     match result {
         Ok(encoded) => {
-            let len = encoded.len();
-            let ptr = encoded.leak().as_mut_ptr();
-            *out = ptr;
-            *out_len = len;
+            // into_boxed_slice() first: `dm2_free` reconstructs the Vec with
+            // capacity == len, so the allocation must actually be len bytes.
+            // Leaking a Vec whose capacity exceeds its length would hand back
+            // a pointer that is later freed with the wrong layout.
+            let boxed = encoded.into_boxed_slice();
+            let len = boxed.len();
+            let ptr = Box::into_raw(boxed) as *mut u8;
+            // SAFETY: `out`/`out_len` non-null checked above; the writes happen
+            // inside the guard so a panic can't unwind across the C boundary.
+            unsafe { *out = ptr; *out_len = len; }
             0
         }
         Err(e) => e as i32,
     }
+    })
 }
 
 /// Encode with explicit Apple semantics: `quality` (0 or 1 — 1 halves
@@ -149,16 +160,24 @@ pub unsafe extern "C" fn dm2_encode_opts(
         return Dm2Error::InvalidArg as i32;
     };
     let pix = slice::from_raw_parts(pixels, pixels_len);
+    guard(move || {
     match crate::dm2_encode_opts(pix, &info_r, comp, quality as u8, param as u8) {
         Ok(encoded) => {
-            let len = encoded.len();
-            let ptr = encoded.leak().as_mut_ptr();
-            *out = ptr;
-            *out_len = len;
+            // into_boxed_slice() first: `dm2_free` reconstructs the Vec with
+            // capacity == len, so the allocation must actually be len bytes.
+            // Leaking a Vec whose capacity exceeds its length would hand back
+            // a pointer that is later freed with the wrong layout.
+            let boxed = encoded.into_boxed_slice();
+            let len = boxed.len();
+            let ptr = Box::into_raw(boxed) as *mut u8;
+            // SAFETY: `out`/`out_len` non-null checked above; the writes happen
+            // inside the guard so a panic can't unwind across the C boundary.
+            unsafe { *out = ptr; *out_len = len; }
             0
         }
         Err(e) => e as i32,
     }
+    })
 }
 
 /// Decode deepmap2 data into a pixel buffer.
@@ -221,7 +240,11 @@ pub unsafe extern "C" fn dm2_encode_bound(info: *const Dm2ImageInfo) -> usize {
     crate::dm2_encode_bound(&info_r)
 }
 
-/// Free a buffer allocated by `dm2_encode`.
+/// Free a buffer allocated by `dm2_encode` / `dm2_encode_opts`.
+///
+/// `len` must be exactly the `out_len` those functions returned — the
+/// allocation is freed with that size, so a different value frees with the
+/// wrong layout and corrupts the heap under any sized-free allocator.
 #[no_mangle]
 pub unsafe extern "C" fn dm2_free(ptr: *mut u8, len: usize) {
     if !ptr.is_null() && len > 0 {

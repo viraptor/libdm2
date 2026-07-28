@@ -103,7 +103,10 @@ where
         // Bounds checked immediately above.
         let tile_sz = u32::from_le_bytes([data[offset], data[offset + 1], data[offset + 2], data[offset + 3]]) as usize;
         offset += 4;
-        if offset + tile_sz > data.len() {
+        // Compare by subtraction, not `offset + tile_sz > data.len()`:
+        // `tile_sz` is a full attacker-controlled u32, so on a 32-bit target
+        // the sum would wrap past this guard and the slice below would panic.
+        if tile_sz > data.len() - offset {
             return Err(Dm2Error::DecodeFailed);
         }
         let rows = tile_h.min(h - pixel_row);

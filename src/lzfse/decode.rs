@@ -62,7 +62,16 @@ impl HeaderV1 {
 
     /// lzfse_check_block_header_v1 (magic is checked by the caller's dispatch).
     fn check(&self) -> bool {
-        self.n_literals as usize <= LZFSE_LITERALS_PER_BLOCK
+        // `literal_bits`/`lmd_bits` are a raw i32 in a v1 header, so a hostile
+        // stream can set them to anything; the encoder only ever emits [-7, 0]
+        // (the v2 header can't express anything else — it stores bits+7 in
+        // three bits). Reject the rest here: `FseInStream::init` adds 64 to
+        // this value, which overflows i32 near i32::MAX. Apple's C relies on
+        // signed wraparound and a later range test; in Rust that add is a
+        // panic under overflow checks.
+        (-7..=0).contains(&self.literal_bits)
+            && (-7..=0).contains(&self.lmd_bits)
+            && self.n_literals as usize <= LZFSE_LITERALS_PER_BLOCK
             && self.n_matches as usize <= LZFSE_MATCHES_PER_BLOCK
             && self.literal_state.iter().all(|&s| (s as i32) < LZFSE_ENCODE_LITERAL_STATES)
             && (self.l_state as i32) < LZFSE_ENCODE_L_STATES

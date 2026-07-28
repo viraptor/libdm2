@@ -54,8 +54,19 @@ pub fn dm2_pixel_size(format: PixelFormat) -> usize {
 }
 
 /// Upper bound on encoded output size (for pre-allocating buffers).
+///
+/// Returns 0 for dimensions whose bound is not representable — callers must
+/// treat 0 as "cannot encode this image" rather than as a size. Computing it
+/// with wrapping arithmetic would be worse than useless: it can return a
+/// value *smaller* than the raw pixel data, so a caller sizing a buffer from
+/// it would under-allocate.
 pub fn dm2_encode_bound(info: &ImageInfo) -> usize {
     // Worst case: type 2 expands ~2x, LZFSE can expand ~12.5%, plus header + tile overhead
-    let raw = info.raw_size();
-    raw * 3 + 4096
+    match info.checked_raw_size() {
+        Ok(raw) => raw
+            .checked_mul(3)
+            .and_then(|v| v.checked_add(4096))
+            .unwrap_or(0),
+        Err(_) => 0,
+    }
 }

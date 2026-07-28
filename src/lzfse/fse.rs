@@ -89,6 +89,12 @@ fn load8_padded(src: &[u8], pos: usize) -> u64 {
 impl FseInStream {
     /// Initialize so the accumulator holds 56..=63 bits, reading backwards
     /// from `*pbuf`. `n` is the encoder's final `accum_nbits` in [-7, 0].
+    ///
+    /// `n` reaches here straight from a stream header, so the additions below
+    /// use checked arithmetic: the C original lets them wrap (signed overflow
+    /// UB that happens to be benign there, since the range test right after
+    /// rejects the result), but in Rust an unchecked add panics under overflow
+    /// checks. Callers also validate the field; this is the backstop.
     pub fn init(&mut self, n: i32, pbuf: &mut usize, buf_start: usize, src: &[u8]) -> Result<(), ()> {
         if n != 0 {
             if *pbuf < buf_start + 8 {
@@ -96,7 +102,7 @@ impl FseInStream {
             }
             *pbuf -= 8;
             self.accum = u64::from_le_bytes(src[*pbuf..*pbuf + 8].try_into().unwrap());
-            self.accum_nbits = n + 64;
+            self.accum_nbits = n.checked_add(64).ok_or(())?;
         } else {
             if *pbuf < buf_start + 7 {
                 return Err(());
@@ -105,7 +111,7 @@ impl FseInStream {
             let mut b = [0u8; 8];
             b[..7].copy_from_slice(&src[*pbuf..*pbuf + 7]);
             self.accum = u64::from_le_bytes(b);
-            self.accum_nbits = n + 56;
+            self.accum_nbits = n.checked_add(56).ok_or(())?;
         }
         if !(56..64).contains(&self.accum_nbits) || (self.accum >> self.accum_nbits) != 0 {
             return Err(());
